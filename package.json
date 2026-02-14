@@ -21,6 +21,6 @@
     "better-sqlite3": "^12.6.2"
   },
   "optionalDependencies": {
-    "@google-cloud/firestore": "^7.0.0"
+    "@google-cloud/firestore": "^8.3.0"
   }
 }
