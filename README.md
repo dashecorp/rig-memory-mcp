@@ -193,6 +193,49 @@ To keep memory useful, update it immediately after making changes:
 
 ---
 
+## Temporal Decay (NEW in v2.2)
+
+Memory retrieval now supports **temporal decay** - results are weighted by recency so that recent memories surface first, while older ones gradually fade in relevance.
+
+### How It Works
+
+Each memory type has a different decay rate based on typical lifespan:
+
+| Type | Half-life | Rationale |
+|------|-----------|-----------|
+| Decisions | ~350 days | Architecture decisions stay relevant long-term |
+| Learnings | ~140 days | Patterns and gotchas fade as codebases evolve |
+| Errors | ~70 days | Error solutions become stale fastest (deps change, APIs update) |
+
+The decay formula is exponential: `score = e^(-λ × days_since_created)`. Priority is still respected first (critical > high > normal), then decay determines order within the same priority tier.
+
+### Default Behavior
+
+| Tool | Temporal Decay Default | Reason |
+|------|----------------------|--------|
+| `recall_decisions` | **Off** | Decisions are durable by nature |
+| `recall_learnings` | **On** | Recent patterns more relevant |
+| `find_solution` | **On** | Recent solutions more likely to work |
+| `search_all` | **On** | Recency matters in general search |
+| `load_comprehensive_memory` | **On** | Session starts benefit from recent-first ordering |
+
+### Usage
+
+```
+# Explicit opt-in for decisions
+recall_decisions(project: "my-app", temporal_decay: true)
+
+# Opt-out for learnings (use default ordering: priority, then newest-first)
+recall_learnings(project: "my-app", temporal_decay: false)
+
+# search_all uses decay by default
+search_all(project: "my-app", query: "authentication")
+```
+
+Results include age indicators like `(3d ago)`, `(2mo ago)`, `(1y ago)` when temporal decay is active.
+
+---
+
 ## Best Practices
 
 ### Project Naming

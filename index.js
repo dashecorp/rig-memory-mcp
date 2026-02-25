@@ -342,6 +342,60 @@ const trackLearningAccess = db.prepare(
   "UPDATE learnings SET access_count = COALESCE(access_count, 0) + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = ?"
 );
 
+// Temporal decay configuration
+// λ values control half-life: half_life = ln(2) / λ ≈ 0.693 / λ
+const DECAY_LAMBDA = {
+  learnings: 0.005,   // half-life ~140 days
+  errors: 0.01,       // half-life ~70 days
+  decisions: 0.002,   // half-life ~350 days
+};
+
+// Normalize SQLite CURRENT_TIMESTAMP (UTC but no timezone indicator) to ISO-8601 UTC
+function normalizeTimestamp(ts) {
+  if (!ts) return null;
+  // SQLite CURRENT_TIMESTAMP: "YYYY-MM-DD HH:MM:SS" (UTC, no TZ indicator)
+  // V8 would parse this as local time without the 'Z', so normalize to UTC
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(ts)) {
+    return ts.replace(' ', 'T') + 'Z';
+  }
+  return ts;
+}
+
+// Compute temporal decay factor for a given timestamp
+function computeDecayFactor(createdAt, type) {
+  if (!createdAt) return 1;
+  const lambda = DECAY_LAMBDA[type] || 0.005;
+  const now = Date.now();
+  const created = new Date(normalizeTimestamp(createdAt)).getTime();
+  const daysSince = (now - created) / (1000 * 60 * 60 * 24);
+  return Math.exp(-lambda * daysSince);
+}
+
+// Format age for display (e.g., "2d ago", "3mo ago")
+function formatAge(createdAt) {
+  if (!createdAt) return '';
+  const now = Date.now();
+  const created = new Date(normalizeTimestamp(createdAt)).getTime();
+  const days = Math.floor((now - created) / (1000 * 60 * 60 * 24));
+  if (days === 0) return 'today';
+  if (days === 1) return '1d ago';
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  if (days < 365) return `${months}mo ago`;
+  const years = Math.floor(days / 365);
+  return `${years}y ago`;
+}
+
+// Apply temporal decay scoring and annotate results with age/decay metadata
+// Preserves the original ordering provided by the caller (typically SQL ORDER BY)
+function applyTemporalDecay(results, type, timestampField = 'created_at') {
+  return results.map(r => ({
+    ...r,
+    _decayFactor: computeDecayFactor(r[timestampField], type),
+    _age: formatAge(r[timestampField]),
+  }));
+}
+
 // Create MCP server
 const server = new Server(
   {
@@ -401,7 +455,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "recall_decisions",
-        description: "Retrieve past decisions for a project",
+        description: "Retrieve past decisions for a project. Optionally weight results by recency via the temporal_decay flag (default false for decisions).",
         inputSchema: {
           type: "object",
           properties: {
@@ -409,6 +463,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             search: { type: "string", description: "Optional search term" },
             category: { type: "string", description: "Filter by category (e.g., 'architecture', 'security')" },
             limit: { type: "number", description: "Max results (default 10)" },
+            temporal_decay: { type: "boolean", description: "Weight results by recency (default false for decisions)" },
           },
           required: ["project"],
         },
@@ -442,13 +497,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "find_solution",
-        description: "Search for solutions to an error",
+        description: "Search for solutions to an error. Results are weighted by recency (temporal decay) by default.",
         inputSchema: {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name" },
             error: { type: "string", description: "Error message to search for" },
             category: { type: "string", description: "Filter by category (e.g., 'build', 'runtime', 'api')" },
+            temporal_decay: { type: "boolean", description: "Weight results by recency (default true for errors)" },
           },
           required: ["project", "error"],
         },
@@ -493,13 +549,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "recall_learnings",
-        description: "Retrieve past learnings",
+        description: "Retrieve past learnings. Results are weighted by recency (temporal decay) by default.",
         inputSchema: {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name (also includes global learnings)" },
             search: { type: "string", description: "Optional search term" },
             limit: { type: "number", description: "Max results (default 20)" },
+            temporal_decay: { type: "boolean", description: "Weight results by recency (default true for learnings)" },
           },
           required: ["project"],
         },
@@ -530,12 +587,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_all",
-        description: "Search across all memory types (decisions, errors, learnings, context)",
+        description: "Search across all memory types (decisions, errors, learnings, context). Results are weighted by recency (temporal decay) by default.",
         inputSchema: {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name" },
             query: { type: "string", description: "Search term" },
+            temporal_decay: { type: "boolean", description: "Weight results by recency (default true)" },
           },
           required: ["project", "query"],
         },
@@ -592,12 +650,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "load_comprehensive_memory",
-        description: "Load comprehensive memory for a project with higher limits - use this for thorough session starts. Returns 30 decisions, 50 learnings, 15 errors, all context, and all sessions.",
+        description: "Load comprehensive memory for a project with higher limits - use this for thorough session starts. Returns 30 decisions, 50 learnings, 15 errors, all context, and all sessions. Results are sorted by temporal decay (recent items ranked higher).",
         inputSchema: {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name" },
             include_global: { type: "boolean", description: "Also load global context (default: true)" },
+            temporal_decay: { type: "boolean", description: "Weight results by recency (default true)" },
           },
           required: ["project"],
         },
@@ -730,13 +789,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         // Track access for memory tiers
         results.forEach(r => trackDecisionAccess.run(r.id));
+        // Apply temporal decay if requested (default false for decisions - they're durable)
+        if (args.temporal_decay) {
+          results = applyTemporalDecay(results, 'decisions', 'date');
+        }
         return {
           content: [{
             type: "text",
             text: results.length > 0
               ? results.map(r => {
                   const categoryTag = r.category ? ` [${r.category}]` : '';
-                  return `[${r.date}]${categoryTag} ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`;
+                  const age = r._age ? ` (${r._age})` : '';
+                  return `[${r.date}]${categoryTag}${age} ${r.decision}\n  Rationale: ${r.rationale || 'N/A'}`;
                 }).join("\n\n")
               : "No decisions found for this project"
           }]
@@ -786,13 +850,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         // Track access for memory tiers
         results.forEach(r => trackErrorAccess.run(r.id));
+        // Apply temporal decay (default true for errors - recent solutions more relevant)
+        if (args.temporal_decay !== false) {
+          results = applyTemporalDecay(results, 'errors');
+        }
         return {
           content: [{
             type: "text",
             text: results.length > 0
               ? results.map(r => {
                   const categoryTag = r.category ? ` [${r.category}]` : '';
-                  return `Error:${categoryTag} ${r.error_pattern}\nSolution: ${r.solution}\nContext: ${r.context || 'N/A'}`;
+                  const age = r._age ? ` (${r._age})` : '';
+                  return `Error:${categoryTag}${age} ${r.error_pattern}\nSolution: ${r.solution}\nContext: ${r.context || 'N/A'}`;
                 }).join("\n\n---\n\n")
               : "No matching solutions found"
           }]
@@ -861,11 +930,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         // Track access for memory tiers
         results.forEach(r => trackLearningAccess.run(r.id));
+        // Apply temporal decay (default true for learnings - recent patterns more relevant)
+        if (args.temporal_decay !== false) {
+          results = applyTemporalDecay(results, 'learnings');
+        }
         return {
           content: [{
             type: "text",
             text: results.length > 0
-              ? results.map(r => `[${r.category}] ${r.content}${r.project ? ` (${r.project})` : ' (global)'}`).join("\n\n")
+              ? results.map(r => {
+                  const age = r._age ? ` (${r._age})` : '';
+                  return `[${r.category}]${age} ${r.content}${r.project ? ` (${r.project})` : ' (global)'}`;
+                }).join("\n\n")
               : "No learnings found"
           }]
         };
@@ -900,22 +976,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "search_all": {
         const pattern = `%${args.query}%`;
-        const decisions = searchDecisions.all(args.project, pattern, pattern);
-        const errors = findSolution.all(args.project, pattern);
-        const learnings = searchLearnings.all(args.project, pattern);
+        let decisions = searchDecisions.all(args.project, pattern, pattern);
+        let errors = findSolution.all(args.project, pattern);
+        let learnings = searchLearnings.all(args.project, pattern);
         const contexts = db.prepare(
           "SELECT key, value FROM context WHERE project = ? AND (key LIKE ? OR value LIKE ?)"
         ).all(args.project, pattern, pattern);
 
+        // Apply temporal decay (default true for search_all)
+        if (args.temporal_decay !== false) {
+          decisions = applyTemporalDecay(decisions, 'decisions', 'date');
+          errors = applyTemporalDecay(errors, 'errors');
+          learnings = applyTemporalDecay(learnings, 'learnings');
+        }
+
         let output = [];
         if (decisions.length > 0) {
-          output.push("=== DECISIONS ===\n" + decisions.map(r => `[${r.date}] ${r.decision}`).join("\n"));
+          output.push("=== DECISIONS ===\n" + decisions.map(r => {
+            const age = r._age ? ` (${r._age})` : '';
+            return `[${r.date}]${age} ${r.decision}`;
+          }).join("\n"));
         }
         if (errors.length > 0) {
-          output.push("=== ERRORS ===\n" + errors.map(r => `${r.error_pattern}: ${r.solution}`).join("\n"));
+          output.push("=== ERRORS ===\n" + errors.map(r => {
+            const age = r._age ? ` (${r._age})` : '';
+            return `${age ? age + ' ' : ''}${r.error_pattern}: ${r.solution}`;
+          }).join("\n"));
         }
         if (learnings.length > 0) {
-          output.push("=== LEARNINGS ===\n" + learnings.map(r => `[${r.category}] ${r.content}`).join("\n"));
+          output.push("=== LEARNINGS ===\n" + learnings.map(r => {
+            const age = r._age ? ` (${r._age})` : '';
+            return `[${r.category}]${age} ${r.content}`;
+          }).join("\n"));
         }
         if (contexts.length > 0) {
           output.push("=== CONTEXT ===\n" + contexts.map(r => `${r.key}: ${r.value}`).join("\n"));
@@ -1076,6 +1168,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "load_comprehensive_memory": {
         // Load comprehensive memory with higher limits for thorough session starts
         const includeGlobal = args.include_global !== false;
+        const useDecay = args.temporal_decay !== false; // default true
 
         // Higher limits for comprehensive loading
         const DECISION_LIMIT = 30;
@@ -1084,9 +1177,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const sessions = getAllSessionsForProject.all(args.project);
         const contextItems = getContext.all(args.project);
-        const decisions = getDecisions.all(args.project, DECISION_LIMIT);
-        const learnings = getLearnings.all(args.project, LEARNING_LIMIT);
-        const errors = getRecentErrors.all(args.project, ERROR_LIMIT);
+        let decisions = getDecisions.all(args.project, DECISION_LIMIT);
+        let learnings = getLearnings.all(args.project, LEARNING_LIMIT);
+        let errors = getRecentErrors.all(args.project, ERROR_LIMIT);
+
+        // Apply temporal decay for sorting
+        if (useDecay) {
+          decisions = applyTemporalDecay(decisions, 'decisions', 'date');
+          learnings = applyTemporalDecay(learnings, 'learnings');
+          errors = applyTemporalDecay(errors, 'errors');
+        }
 
         // Get global context and learnings if requested
         let globalContext = [];
@@ -1156,20 +1256,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           decisions.forEach(d => {
             const categoryTag = d.category ? `[${d.category}] ` : '';
             const tier = tierIcon(getTier(d));
-            output.push(`- ${priorityIcon(d.priority)}${tier}**[${d.date}]** ${categoryTag}${d.decision}`);
+            const age = d._age ? ` _(${d._age})_` : '';
+            output.push(`- ${priorityIcon(d.priority)}${tier}**[${d.date}]** ${categoryTag}${d.decision}${age}`);
             if (d.rationale) output.push(`  _Rationale: ${d.rationale}_`);
           });
           output.push('');
         }
 
         // Learnings (project + global combined, deduplicated)
-        const allLearnings = [...learnings];
+        let allLearnings = [...learnings];
         if (includeGlobal) {
-          globalLearnings.forEach(g => {
-            if (!allLearnings.find(l => l.id === g.id)) {
-              allLearnings.push(g);
-            }
-          });
+          let globalLearningsToAdd = globalLearnings.filter(g => !allLearnings.find(l => l.id === g.id));
+          if (useDecay) {
+            globalLearningsToAdd = applyTemporalDecay(globalLearningsToAdd, 'learnings');
+          }
+          allLearnings.push(...globalLearningsToAdd);
+        }
+        // Re-sort combined list by decay if enabled
+        if (useDecay && allLearnings.length > 0) {
+          allLearnings = applyTemporalDecay(allLearnings, 'learnings');
         }
         if (allLearnings.length > 0) {
           const highPriorityCount = allLearnings.filter(l => (l.priority || 0) > 0).length;
@@ -1177,7 +1282,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           output.push(`## 💡 Learnings (${allLearnings.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
           allLearnings.forEach(l => {
             const tier = tierIcon(getTier(l));
-            output.push(`- ${priorityIcon(l.priority)}${tier}[${l.category}] ${l.content}${l.project ? '' : ' _(global)_'}`);
+            const age = l._age ? ` _(${l._age})_` : '';
+            output.push(`- ${priorityIcon(l.priority)}${tier}[${l.category}] ${l.content}${l.project ? '' : ' _(global)_'}${age}`);
           });
           output.push('');
         }
@@ -1190,7 +1296,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           errors.forEach(e => {
             const categoryTag = e.category ? `[${e.category}] ` : '';
             const tier = tierIcon(getTier(e));
-            output.push(`- ${priorityIcon(e.priority)}${tier}${categoryTag}**${e.error_pattern}**`);
+            const age = e._age ? ` _(${e._age})_` : '';
+            output.push(`- ${priorityIcon(e.priority)}${tier}${categoryTag}**${e.error_pattern}**${age}`);
             output.push(`  Solution: ${e.solution}`);
             if (e.context) output.push(`  Context: ${e.context}`);
           });
