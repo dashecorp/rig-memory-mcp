@@ -269,6 +269,54 @@ Use snake_case for context keys:
 
 ---
 
+## Usage Examples
+
+### Remember a Decision
+
+```
+remember_decision(
+  project: "my-app",
+  decision: "Use RevenueCat for subscription management",
+  rationale: "Handles receipt validation, cross-platform, and reduces server-side complexity"
+)
+```
+
+### Recall Past Decisions
+
+```
+recall_decisions(project: "my-app", limit: 5)
+# Returns most recent decisions, optionally filtered by keyword:
+recall_decisions(project: "my-app", search: "authentication")
+```
+
+### Session Continuity: Save and Resume
+
+Save before ending a session mid-task:
+
+```
+save_session(
+  project: "my-app",
+  task: "Implementing push notifications",
+  status: "in-progress",
+  notes: "APNs cert done. Still need: device token registration, topic routing"
+)
+```
+
+Resume next session:
+
+```
+get_session(project: "my-app")
+# Returns task, status, and notes from last saved session
+```
+
+When done:
+
+```
+clear_session(project: "my-app")
+```
+
+---
+
 ## Workflow Examples
 
 ### Starting a New Session
@@ -524,6 +572,62 @@ On each additional machine:
 |------|-------------|
 | `sync_to_cloud` | Push local memory to Firestore |
 | `pull_from_cloud` | Pull memory from Firestore |
+
+---
+
+## Usage Examples
+
+### 1. Remember a Decision
+
+Store an architectural choice with rationale so future sessions know why it was made:
+
+```
+remember_decision(
+  project: "my-app",
+  decision: "Use SQLite over CoreData for local persistence",
+  rationale: "Simpler schema migrations, easier to inspect, no ORM overhead for our use case"
+)
+```
+
+### 2. Recall Past Decisions
+
+Query stored decisions at the start of a session or before making related changes:
+
+```
+recall_decisions(project: "my-app", limit: 5)
+# Returns: recent decisions with rationale, timestamps, and priority
+```
+
+### 3. Save Session State (mid-task)
+
+Preserve work-in-progress before ending a session so the next session can resume instantly:
+
+```
+save_session(
+  project: "my-app",
+  task: "Implementing push notifications",
+  status: "in-progress",
+  notes: "APNs registration done. Remaining: badge count sync, deep-link routing on tap"
+)
+```
+
+### 4. Resume a Session
+
+At the start of a new session, check for unfinished work and load project context together:
+
+```
+get_session(project: "my-app")
+# → Restores task, status, and notes from last save_session call
+
+get_context(project: "my-app")
+# → Returns stored config: SDK version, API URLs, bundle ID, etc.
+```
+
+When the task is complete, clear the session:
+
+```
+clear_session(project: "my-app")
+```
 
 ---
 
