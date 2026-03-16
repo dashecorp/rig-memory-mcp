@@ -18,7 +18,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
-    "better-sqlite3": "^12.6.2"
+    "better-sqlite3": "^12.8.0"
   },
   "optionalDependencies": {
     "@google-cloud/firestore": "^8.3.0"
