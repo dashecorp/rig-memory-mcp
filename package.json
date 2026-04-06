@@ -17,7 +17,7 @@
   "author": "Stig-Johnny Stoebakk",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.28.0",
     "better-sqlite3": "^12.8.0"
   },
   "optionalDependencies": {
