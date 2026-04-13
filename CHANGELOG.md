@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/dashecorp/claude-memory-mcp/compare/claude-memory-mcp-v1.1.0...claude-memory-mcp-v1.2.0) (2026-04-13)
+
+
+### Features
+
+* add PostgreSQL backend for persistent shared memory ([#26](https://github.com/dashecorp/claude-memory-mcp/issues/26)) ([9d21cfc](https://github.com/dashecorp/claude-memory-mcp/commit/9d21cfcb7e83f37f9fe5560b423eafa61ae23a8a))
+
+
+### Bug Fixes
+
+* strip undefined values before Firestore sync ([#28](https://github.com/dashecorp/claude-memory-mcp/issues/28)) ([5127d77](https://github.com/dashecorp/claude-memory-mcp/commit/5127d773bd54452b0159b722c0d27e40f00a8679))
+
 ## [1.1.0](https://github.com/Stig-Johnny/claude-memory-mcp/compare/claude-memory-mcp-v1.0.0...claude-memory-mcp-v1.1.0) (2026-03-05)
 
 
