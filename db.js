@@ -138,13 +138,13 @@ const PG_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sessions (
     id SERIAL PRIMARY KEY,
     project TEXT NOT NULL,
-    workspace TEXT,
+    workspace TEXT NOT NULL DEFAULT '',
     task TEXT NOT NULL,
     status TEXT,
     notes TEXT,
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     synced_at TEXT,
-    UNIQUE(project, COALESCE(workspace, ''))
+    UNIQUE(project, workspace)
   );
   CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
   CREATE INDEX IF NOT EXISTS idx_errors_project ON errors(project);
@@ -456,6 +456,7 @@ class SqliteBackend {
       errors: this.db.prepare(`SELECT * FROM errors WHERE project = ? ${filter}`).all(project),
       context: this.db.prepare("SELECT * FROM context WHERE project = ?").all(project),
       learnings: this.db.prepare(`SELECT * FROM learnings WHERE project = ? ${filter}`).all(project),
+      sessions: this.db.prepare("SELECT * FROM sessions WHERE project = ?").all(project),
     };
   }
 
@@ -628,28 +629,26 @@ class PostgresBackend {
   }
 
   // -- Sessions --
+  // Postgres normalizes null workspace to '' for UNIQUE constraint
   async upsertSession(project, workspace, task, status, notes) {
+    const ws = workspace ?? "";
     await this.pool.query(
       `INSERT INTO sessions (project, workspace, task, status, notes, updated_at)
        VALUES ($1, $2, $3, $4, $5, NOW())
-       ON CONFLICT(project, COALESCE(workspace, ''))
+       ON CONFLICT(project, workspace)
        DO UPDATE SET task = EXCLUDED.task, status = EXCLUDED.status, notes = EXCLUDED.notes, updated_at = NOW()`,
-      [project, workspace, task, status, notes]
+      [project, ws, task, status, notes]
     );
   }
 
   async getSession(project, workspace) {
-    if (workspace === null || workspace === undefined) {
-      return this._get("SELECT * FROM sessions WHERE project = $1 AND workspace IS NULL", [project]);
-    }
-    return this._get("SELECT * FROM sessions WHERE project = $1 AND workspace = $2", [project, workspace]);
+    const ws = workspace ?? "";
+    return this._get("SELECT * FROM sessions WHERE project = $1 AND workspace = $2", [project, ws]);
   }
 
   async deleteSession(project, workspace) {
-    if (workspace === null || workspace === undefined) {
-      return this._run("DELETE FROM sessions WHERE project = $1 AND workspace IS NULL", [project]);
-    }
-    return this._run("DELETE FROM sessions WHERE project = $1 AND workspace = $2", [project, workspace]);
+    const ws = workspace ?? "";
+    return this._run("DELETE FROM sessions WHERE project = $1 AND workspace = $2", [project, ws]);
   }
 
   async deleteAllSessions(project) {
@@ -772,13 +771,14 @@ class PostgresBackend {
   // -- Export / Import --
   async exportProject(project, includeArchived) {
     const filter = includeArchived ? "" : "AND (archived IS NULL OR archived = 0)";
-    const [decisions, errors, context, learnings] = await Promise.all([
+    const [decisions, errors, context, learnings, sessions] = await Promise.all([
       this._all(`SELECT * FROM decisions WHERE project = $1 ${filter}`, [project]),
       this._all(`SELECT * FROM errors WHERE project = $1 ${filter}`, [project]),
       this._all("SELECT * FROM context WHERE project = $1", [project]),
       this._all(`SELECT * FROM learnings WHERE project = $1 ${filter}`, [project]),
+      this._all("SELECT * FROM sessions WHERE project = $1", [project]),
     ]);
-    return { decisions, errors, context, learnings };
+    return { decisions, errors, context, learnings, sessions };
   }
 
   get dbPath() {

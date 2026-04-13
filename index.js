@@ -537,7 +537,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           results = await db.getDecisions(args.project, args.limit || 10);
         }
-        for (const r of results) await db.trackDecisionAccess(r.id);
+        await Promise.all(results.map(r => db.trackDecisionAccess(r.id)));
         if (args.temporal_decay) {
           results = applyTemporalDecay(results, 'decisions', 'date');
         }
@@ -593,7 +593,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           results = await db.findSolution(args.project, pattern);
         }
-        for (const r of results) await db.trackErrorAccess(r.id);
+        await Promise.all(results.map(r => db.trackErrorAccess(r.id)));
         if (args.temporal_decay !== false) {
           results = applyTemporalDecay(results, 'errors');
         }
@@ -665,7 +665,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           results = await db.getLearnings(args.project, args.limit || 20);
         }
-        for (const r of results) await db.trackLearningAccess(r.id);
+        await Promise.all(results.map(r => db.trackLearningAccess(r.id)));
         if (args.temporal_decay !== false) {
           results = applyTemporalDecay(results, 'learnings');
         }
@@ -1204,15 +1204,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!firestoreSync) {
           return { content: [{ type: "text", text: "Firestore sync not enabled. Configure in ~/.claude/memory-config.json" }] };
         }
-        // Firestore sync only works well with SQLite export
-        const tables = ["decisions", "errors", "context", "learnings"];
         let synced = 0;
-        for (const table of tables) {
-          const data = await db.exportProject(args.project === "all" ? "%" : args.project, true);
-          const rows = data[table] || [];
-          for (const row of rows) {
-            await firestoreSync.syncToCloud(table, row);
-            synced++;
+        const projects = args.project === "all"
+          ? (await db.getAllProjects()).map(p => p.project)
+          : [args.project];
+
+        for (const proj of projects) {
+          const data = await db.exportProject(proj, true);
+          for (const table of ["decisions", "errors", "context", "learnings", "sessions"]) {
+            for (const row of data[table] || []) {
+              await firestoreSync.syncToCloud(table, row);
+              synced++;
+            }
           }
         }
         return { content: [{ type: "text", text: `Synced ${synced} records to Firestore` }] };
@@ -1223,7 +1226,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "Firestore sync not enabled. Configure in ~/.claude/memory-config.json" }] };
         }
 
-        const tables = ["decisions", "errors", "context", "learnings"];
+        const tables = ["decisions", "errors", "context", "learnings", "sessions"];
         let pulled = 0;
 
         for (const table of tables) {
@@ -1238,6 +1241,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 await db.upsertContext(record.project, record.key, record.value);
               } else if (table === "learnings") {
                 await db.insertLearning(record.project, record.category, record.content);
+              } else if (table === "sessions") {
+                await db.upsertSession(record.project, record.workspace || null, record.task, record.status, record.notes);
               }
               pulled++;
             } catch { /* skip duplicates */ }
