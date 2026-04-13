@@ -6,10 +6,10 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import Database from "better-sqlite3";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, readFileSync } from "fs";
+import { createDatabase } from "./db.js";
 
 // Configuration
 const CONFIG_PATH = join(homedir(), ".claude", "memory-config.json");
@@ -19,8 +19,7 @@ let firestoreSync = null;
 function loadConfig() {
   if (existsSync(CONFIG_PATH)) {
     try {
-      const config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-      return config;
+      return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
     } catch (e) {
       console.error("Failed to load config:", e.message);
     }
@@ -41,7 +40,6 @@ async function initFirestoreSync() {
       projectId: config.firestore.projectId,
     };
 
-    // Use service account if provided, otherwise use application default credentials
     if (config.firestore.keyFilePath) {
       firestoreConfig.keyFilename = config.firestore.keyFilePath;
     }
@@ -55,7 +53,6 @@ async function initFirestoreSync() {
       firestore,
       collectionPrefix,
 
-      // Sync a record to Firestore
       async syncToCloud(table, data) {
         try {
           const docId = `${data.project || 'global'}_${data.id || Date.now()}`;
@@ -69,7 +66,6 @@ async function initFirestoreSync() {
         }
       },
 
-      // Pull all records from Firestore for a project
       async pullFromCloud(table, project) {
         try {
           const snapshot = await firestore
@@ -91,10 +87,6 @@ async function initFirestoreSync() {
   }
 }
 
-// Database setup
-const dbPath = join(homedir(), ".claude", "memory.db");
-const db = new Database(dbPath);
-
 // Helper function for relative time
 function getTimeAgo(timestamp) {
   const now = new Date();
@@ -111,257 +103,21 @@ function getTimeAgo(timestamp) {
   return then.toLocaleDateString();
 }
 
-// Initialize tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS decisions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project TEXT NOT NULL,
-    date TEXT NOT NULL,
-    decision TEXT NOT NULL,
-    rationale TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT,
-    archived INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS errors (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project TEXT NOT NULL,
-    error_pattern TEXT NOT NULL,
-    solution TEXT NOT NULL,
-    context TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT,
-    archived INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS context (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT,
-    UNIQUE(project, key)
-  );
-
-  CREATE TABLE IF NOT EXISTS learnings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project TEXT,
-    category TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT,
-    archived INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project TEXT NOT NULL,
-    workspace TEXT,
-    task TEXT NOT NULL,
-    status TEXT,
-    notes TEXT,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    synced_at TEXT,
-    UNIQUE(project, workspace)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
-  CREATE INDEX IF NOT EXISTS idx_errors_project ON errors(project);
-  CREATE INDEX IF NOT EXISTS idx_context_project ON context(project);
-  CREATE INDEX IF NOT EXISTS idx_learnings_project ON learnings(project);
-  CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
-`);
-
-// Add archived column to existing tables if missing (migration)
-try {
-  db.exec(`ALTER TABLE decisions ADD COLUMN archived INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE errors ADD COLUMN archived INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE learnings ADD COLUMN archived INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-
-// Add priority column to decisions, errors, learnings (migration v2.5.0)
-// Priority: 0 = normal (default), 1 = high, 2 = critical
-try {
-  db.exec(`ALTER TABLE decisions ADD COLUMN priority INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE errors ADD COLUMN priority INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE learnings ADD COLUMN priority INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-
-// Add category column to decisions and errors (migration v2.6.0)
-// Categories help organize and filter memory items
-try {
-  db.exec(`ALTER TABLE decisions ADD COLUMN category TEXT`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE errors ADD COLUMN category TEXT`);
-} catch (e) { /* column already exists */ }
-
-// Add usage tracking for memory tiers (migration v2.7.0)
-// Tracks access patterns to identify hot/warm/cold memory items
-try {
-  db.exec(`ALTER TABLE decisions ADD COLUMN access_count INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE decisions ADD COLUMN last_accessed TEXT`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE errors ADD COLUMN access_count INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE errors ADD COLUMN last_accessed TEXT`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE learnings ADD COLUMN access_count INTEGER DEFAULT 0`);
-} catch (e) { /* column already exists */ }
-try {
-  db.exec(`ALTER TABLE learnings ADD COLUMN last_accessed TEXT`);
-} catch (e) { /* column already exists */ }
-
-// Migration for multi-workspace support: add workspace column and update unique constraint
-try {
-  // Check if workspace column exists
-  const tableInfo = db.prepare("PRAGMA table_info(sessions)").all();
-  const hasWorkspace = tableInfo.some(col => col.name === 'workspace');
-
-  if (!hasWorkspace) {
-    // Need to recreate the table with the new schema
-    db.exec(`
-      -- Create new table with correct schema
-      CREATE TABLE sessions_new (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        project TEXT NOT NULL,
-        workspace TEXT,
-        task TEXT NOT NULL,
-        status TEXT,
-        notes TEXT,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        synced_at TEXT,
-        UNIQUE(project, workspace)
-      );
-
-      -- Copy existing data (workspace will be NULL for existing sessions)
-      INSERT INTO sessions_new (id, project, task, status, notes, updated_at, synced_at)
-        SELECT id, project, task, status, notes, updated_at, synced_at FROM sessions;
-
-      -- Drop old table and rename new one
-      DROP TABLE sessions;
-      ALTER TABLE sessions_new RENAME TO sessions;
-
-      -- Recreate index
-      CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
-    `);
-    console.error("Migrated sessions table to support multi-workspace");
-  }
-} catch (e) {
-  console.error("Sessions migration error:", e.message);
-}
-
-// Prepared statements
-const insertDecision = db.prepare(
-  "INSERT INTO decisions (project, date, decision, rationale, category) VALUES (?, ?, ?, ?, ?)"
-);
-const getDecisions = db.prepare(
-  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, date DESC LIMIT ?"
-);
-const getDecisionsByCategory = db.prepare(
-  "SELECT * FROM decisions WHERE project = ? AND category = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, date DESC LIMIT ?"
-);
-const searchDecisions = db.prepare(
-  "SELECT * FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0) AND (decision LIKE ? OR rationale LIKE ?) ORDER BY priority DESC, date DESC"
-);
-
-const insertError = db.prepare(
-  "INSERT INTO errors (project, error_pattern, solution, context, category) VALUES (?, ?, ?, ?, ?)"
-);
-const findSolution = db.prepare(
-  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) AND error_pattern LIKE ? ORDER BY priority DESC, created_at DESC LIMIT 5"
-);
-const findSolutionByCategory = db.prepare(
-  "SELECT * FROM errors WHERE project = ? AND category = ? AND (archived IS NULL OR archived = 0) AND error_pattern LIKE ? ORDER BY priority DESC, created_at DESC LIMIT 5"
-);
-const getRecentErrors = db.prepare(
-  "SELECT * FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, created_at DESC LIMIT ?"
-);
-
-const upsertContext = db.prepare(`
-  INSERT INTO context (project, key, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-  ON CONFLICT(project, key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
-`);
-const getContext = db.prepare(
-  "SELECT key, value FROM context WHERE project = ?"
-);
-const getContextValue = db.prepare(
-  "SELECT value FROM context WHERE project = ? AND key = ?"
-);
-const deleteContext = db.prepare(
-  "DELETE FROM context WHERE project = ? AND key = ?"
-);
-
-const insertLearning = db.prepare(
-  "INSERT INTO learnings (project, category, content) VALUES (?, ?, ?)"
-);
-const getLearnings = db.prepare(
-  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) ORDER BY priority DESC, created_at DESC LIMIT ?"
-);
-const searchLearnings = db.prepare(
-  "SELECT * FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0) AND content LIKE ? ORDER BY priority DESC, created_at DESC"
-);
-
-const upsertSessionWithWorkspace = db.prepare(`
-  INSERT INTO sessions (project, workspace, task, status, notes, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-  ON CONFLICT(project, workspace) DO UPDATE SET task = excluded.task, status = excluded.status, notes = excluded.notes, updated_at = CURRENT_TIMESTAMP
-`);
-const getSessionWithWorkspace = db.prepare(
-  "SELECT * FROM sessions WHERE project = ? AND (workspace = ? OR (workspace IS NULL AND ? IS NULL))"
-);
-const deleteSessionWithWorkspace = db.prepare(
-  "DELETE FROM sessions WHERE project = ? AND (workspace = ? OR (workspace IS NULL AND ? IS NULL))"
-);
-const getAllSessionsForProject = db.prepare(
-  "SELECT * FROM sessions WHERE project = ? ORDER BY updated_at DESC"
-);
-
-// Access tracking for memory tiers (v2.7.0)
-const trackDecisionAccess = db.prepare(
-  "UPDATE decisions SET access_count = COALESCE(access_count, 0) + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = ?"
-);
-const trackErrorAccess = db.prepare(
-  "UPDATE errors SET access_count = COALESCE(access_count, 0) + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = ?"
-);
-const trackLearningAccess = db.prepare(
-  "UPDATE learnings SET access_count = COALESCE(access_count, 0) + 1, last_accessed = CURRENT_TIMESTAMP WHERE id = ?"
-);
-
 // Temporal decay configuration
-// λ values control half-life: half_life = ln(2) / λ ≈ 0.693 / λ
 const DECAY_LAMBDA = {
   learnings: 0.005,   // half-life ~140 days
   errors: 0.01,       // half-life ~70 days
   decisions: 0.002,   // half-life ~350 days
 };
 
-// Normalize SQLite CURRENT_TIMESTAMP (UTC but no timezone indicator) to ISO-8601 UTC
 function normalizeTimestamp(ts) {
   if (!ts) return null;
-  // SQLite CURRENT_TIMESTAMP: "YYYY-MM-DD HH:MM:SS" (UTC, no TZ indicator)
-  // V8 would parse this as local time without the 'Z', so normalize to UTC
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(ts)) {
     return ts.replace(' ', 'T') + 'Z';
   }
   return ts;
 }
 
-// Compute temporal decay factor for a given timestamp
 function computeDecayFactor(createdAt, type) {
   if (!createdAt) return 1;
   const lambda = DECAY_LAMBDA[type] || 0.005;
@@ -371,7 +127,6 @@ function computeDecayFactor(createdAt, type) {
   return Math.exp(-lambda * daysSince);
 }
 
-// Format age for display (e.g., "2d ago", "3mo ago")
 function formatAge(createdAt) {
   if (!createdAt) return '';
   const now = Date.now();
@@ -386,8 +141,6 @@ function formatAge(createdAt) {
   return `${years}y ago`;
 }
 
-// Apply temporal decay scoring and annotate results with age/decay metadata
-// Preserves the original ordering provided by the caller (typically SQL ORDER BY)
 function applyTemporalDecay(results, type, timestampField = 'created_at') {
   return results.map(r => ({
     ...r,
@@ -400,7 +153,7 @@ function applyTemporalDecay(results, type, timestampField = 'created_at') {
 const server = new Server(
   {
     name: "claude-memory",
-    version: "2.7.0",
+    version: "3.0.0",
   },
   {
     capabilities: {
@@ -408,6 +161,9 @@ const server = new Server(
     },
   }
 );
+
+// Database instance (initialized in main())
+let db;
 
 // Define tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -759,17 +515,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "remember_decision": {
         const date = args.date || new Date().toISOString().split("T")[0];
-        const result = insertDecision.run(args.project, date, args.decision, args.rationale || null, args.category || null);
+        const id = await db.insertDecision(args.project, date, args.decision, args.rationale || null, args.category || null);
 
-        // Sync to cloud if enabled
         if (firestoreSync) {
           await firestoreSync.syncToCloud("decisions", {
-            id: result.lastInsertRowid,
-            project: args.project,
-            date,
-            decision: args.decision,
-            rationale: args.rationale,
-            category: args.category,
+            id, project: args.project, date,
+            decision: args.decision, rationale: args.rationale, category: args.category,
           });
         }
 
@@ -780,16 +531,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "recall_decisions": {
         let results;
         if (args.category) {
-          results = getDecisionsByCategory.all(args.project, args.category, args.limit || 10);
+          results = await db.getDecisionsByCategory(args.project, args.category, args.limit || 10);
         } else if (args.search) {
-          const pattern = `%${args.search}%`;
-          results = searchDecisions.all(args.project, pattern, pattern);
+          results = await db.searchDecisions(args.project, `%${args.search}%`);
         } else {
-          results = getDecisions.all(args.project, args.limit || 10);
+          results = await db.getDecisions(args.project, args.limit || 10);
         }
-        // Track access for memory tiers
-        results.forEach(r => trackDecisionAccess.run(r.id));
-        // Apply temporal decay if requested (default false for decisions - they're durable)
+        for (const r of results) await db.trackDecisionAccess(r.id);
         if (args.temporal_decay) {
           results = applyTemporalDecay(results, 'decisions', 'date');
         }
@@ -808,7 +556,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "list_decisions": {
-        const results = getDecisions.all(args.project, args.limit || 10);
+        const results = await db.getDecisions(args.project, args.limit || 10);
         return {
           content: [{
             type: "text",
@@ -823,16 +571,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "remember_error": {
-        const result = insertError.run(args.project, args.error_pattern, args.solution, args.context || null, args.category || null);
+        const id = await db.insertError(args.project, args.error_pattern, args.solution, args.context || null, args.category || null);
 
         if (firestoreSync) {
           await firestoreSync.syncToCloud("errors", {
-            id: result.lastInsertRowid,
-            project: args.project,
-            error_pattern: args.error_pattern,
-            solution: args.solution,
-            context: args.context,
-            category: args.category,
+            id, project: args.project,
+            error_pattern: args.error_pattern, solution: args.solution,
+            context: args.context, category: args.category,
           });
         }
 
@@ -844,13 +589,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const pattern = `%${args.error}%`;
         let results;
         if (args.category) {
-          results = findSolutionByCategory.all(args.project, args.category, pattern);
+          results = await db.findSolutionByCategory(args.project, args.category, pattern);
         } else {
-          results = findSolution.all(args.project, pattern);
+          results = await db.findSolution(args.project, pattern);
         }
-        // Track access for memory tiers
-        results.forEach(r => trackErrorAccess.run(r.id));
-        // Apply temporal decay (default true for errors - recent solutions more relevant)
+        for (const r of results) await db.trackErrorAccess(r.id);
         if (args.temporal_decay !== false) {
           results = applyTemporalDecay(results, 'errors');
         }
@@ -869,14 +612,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "set_context": {
-        upsertContext.run(args.project, args.key, args.value);
+        await db.upsertContext(args.project, args.key, args.value);
 
         if (firestoreSync) {
           await firestoreSync.syncToCloud("context", {
             id: `${args.project}_${args.key}`,
-            project: args.project,
-            key: args.key,
-            value: args.value,
+            project: args.project, key: args.key, value: args.value,
           });
         }
 
@@ -885,7 +626,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_context": {
         if (args.key) {
-          const result = getContextValue.get(args.project, args.key);
+          const result = await db.getContextValue(args.project, args.key);
           return {
             content: [{
               type: "text",
@@ -893,7 +634,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }]
           };
         } else {
-          const results = getContext.all(args.project);
+          const results = await db.getContext(args.project);
           return {
             content: [{
               type: "text",
@@ -906,14 +647,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "remember_learning": {
-        const result = insertLearning.run(args.project || null, args.category, args.content);
+        const id = await db.insertLearning(args.project || null, args.category, args.content);
 
         if (firestoreSync) {
           await firestoreSync.syncToCloud("learnings", {
-            id: result.lastInsertRowid,
-            project: args.project,
-            category: args.category,
-            content: args.content,
+            id, project: args.project, category: args.category, content: args.content,
           });
         }
 
@@ -923,14 +661,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "recall_learnings": {
         let results;
         if (args.search) {
-          const pattern = `%${args.search}%`;
-          results = searchLearnings.all(args.project, pattern);
+          results = await db.searchLearnings(args.project, `%${args.search}%`);
         } else {
-          results = getLearnings.all(args.project, args.limit || 20);
+          results = await db.getLearnings(args.project, args.limit || 20);
         }
-        // Track access for memory tiers
-        results.forEach(r => trackLearningAccess.run(r.id));
-        // Apply temporal decay (default true for learnings - recent patterns more relevant)
+        for (const r of results) await db.trackLearningAccess(r.id);
         if (args.temporal_decay !== false) {
           results = applyTemporalDecay(results, 'learnings');
         }
@@ -940,7 +675,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: results.length > 0
               ? results.map(r => {
                   const age = r._age ? ` (${r._age})` : '';
-                  return `[${r.category}]${age} ${r.content}${r.project ? ` (${r.project})` : ' (global)'}`;
+                  return `[${r.category}]${age} ${r.content}${r.project ? '' : ' (global)'}`;
                 }).join("\n\n")
               : "No learnings found"
           }]
@@ -948,11 +683,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "delete_context": {
-        const result = deleteContext.run(args.project, args.key);
+        const changes = await db.deleteContext(args.project, args.key);
         return {
           content: [{
             type: "text",
-            text: result.changes > 0
+            text: changes > 0
               ? `Deleted context key '${args.key}' from ${args.project}`
               : `No context key '${args.key}' found for ${args.project}`
           }]
@@ -960,7 +695,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "list_errors": {
-        const results = getRecentErrors.all(args.project, args.limit || 10);
+        const results = await db.getRecentErrors(args.project, args.limit || 10);
         return {
           content: [{
             type: "text",
@@ -976,14 +711,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "search_all": {
         const pattern = `%${args.query}%`;
-        let decisions = searchDecisions.all(args.project, pattern, pattern);
-        let errors = findSolution.all(args.project, pattern);
-        let learnings = searchLearnings.all(args.project, pattern);
-        const contexts = db.prepare(
-          "SELECT key, value FROM context WHERE project = ? AND (key LIKE ? OR value LIKE ?)"
-        ).all(args.project, pattern, pattern);
+        let decisions = await db.searchDecisions(args.project, pattern);
+        let errors = await db.findSolution(args.project, pattern);
+        let learnings = await db.searchLearnings(args.project, pattern);
+        const contexts = await db.searchContext(args.project, pattern);
 
-        // Apply temporal decay (default true for search_all)
         if (args.temporal_decay !== false) {
           decisions = applyTemporalDecay(decisions, 'decisions', 'date');
           errors = applyTemporalDecay(errors, 'errors');
@@ -1023,16 +755,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "save_session": {
         const workspace = args.workspace || null;
-        upsertSessionWithWorkspace.run(args.project, workspace, args.task, args.status || 'in-progress', args.notes || null);
+        await db.upsertSession(args.project, workspace, args.task, args.status || 'in-progress', args.notes || null);
 
         if (firestoreSync) {
           await firestoreSync.syncToCloud("sessions", {
             id: workspace ? `${args.project}:${workspace}` : args.project,
-            project: args.project,
-            workspace: workspace,
-            task: args.task,
-            status: args.status,
-            notes: args.notes,
+            project: args.project, workspace, task: args.task,
+            status: args.status, notes: args.notes,
           });
         }
 
@@ -1043,8 +772,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_session": {
         const workspace = args.workspace;
         if (workspace !== undefined) {
-          // Get specific workspace session
-          const session = getSessionWithWorkspace.get(args.project, workspace, workspace);
+          const session = await db.getSession(args.project, workspace);
           if (session) {
             const timeAgo = getTimeAgo(session.updated_at);
             const workspaceInfo = session.workspace ? ` [${session.workspace}]` : '';
@@ -1057,8 +785,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           return { content: [{ type: "text", text: "No saved session found" }] };
         } else {
-          // Get all sessions for project
-          const sessions = getAllSessionsForProject.all(args.project);
+          const sessions = await db.getAllSessions(args.project);
           if (sessions.length > 0) {
             const output = sessions.map(session => {
               const timeAgo = getTimeAgo(session.updated_at);
@@ -1074,44 +801,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "clear_session": {
         const workspace = args.workspace;
         if (workspace !== undefined) {
-          const result = deleteSessionWithWorkspace.run(args.project, workspace, workspace);
+          const changes = await db.deleteSession(args.project, workspace);
           const workspaceInfo = workspace ? ` (workspace: ${workspace})` : '';
           return {
             content: [{
               type: "text",
-              text: result.changes > 0 ? `Session cleared for ${args.project}${workspaceInfo}` : "No session to clear"
+              text: changes > 0 ? `Session cleared for ${args.project}${workspaceInfo}` : "No session to clear"
             }]
           };
         } else {
-          // Clear all sessions for project
-          const result = db.prepare("DELETE FROM sessions WHERE project = ?").run(args.project);
+          const changes = await db.deleteAllSessions(args.project);
           return {
             content: [{
               type: "text",
-              text: result.changes > 0 ? `All sessions cleared for ${args.project} (${result.changes} session(s))` : "No sessions to clear"
+              text: changes > 0 ? `All sessions cleared for ${args.project} (${changes} session(s))` : "No sessions to clear"
             }]
           };
         }
       }
 
       case "memory_status": {
-        // Get comprehensive summary for session start
-        const sessions = getAllSessionsForProject.all(args.project);
-        const contextItems = getContext.all(args.project);
-        const decisions = getDecisions.all(args.project, 5);
-        const learnings = getLearnings.all(args.project, 5);
-        const errors = getRecentErrors.all(args.project, 3);
-
-        // Also get global learnings
-        const globalLearnings = db.prepare(
-          "SELECT * FROM learnings WHERE project IS NULL AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT 5"
-        ).all();
+        const sessions = await db.getAllSessions(args.project);
+        const contextItems = await db.getContext(args.project);
+        const decisions = await db.getDecisions(args.project, 5);
+        const learnings = await db.getLearnings(args.project, 5);
+        const errors = await db.getRecentErrors(args.project, 3);
+        const globalLearnings = await db.getGlobalLearnings(5);
 
         let output = [`# Memory Status for ${args.project}\n`];
 
-        // Session status (show all workspace sessions)
         if (sessions.length > 0) {
-          output.push(`## 📋 Active Sessions (${sessions.length})`);
+          output.push(`## Active Sessions (${sessions.length})`);
           for (const session of sessions) {
             const timeAgo = getTimeAgo(session.updated_at);
             const workspaceLabel = session.workspace ? `[${session.workspace}]` : '[default]';
@@ -1123,94 +843,82 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Context
         if (contextItems.length > 0) {
-          output.push(`## ⚙️ Context (${contextItems.length} items)`);
+          output.push(`## Context (${contextItems.length} items)`);
           contextItems.forEach(c => output.push(`- **${c.key}:** ${c.value}`));
           output.push('');
         }
 
-        // Recent decisions
         if (decisions.length > 0) {
-          output.push(`## 🎯 Recent Decisions`);
+          output.push(`## Recent Decisions`);
           decisions.forEach(d => output.push(`- [${d.date}] ${d.decision}`));
           output.push('');
         }
 
-        // Recent learnings (project + global)
         const allLearnings = [...learnings, ...globalLearnings.filter(g => !learnings.find(l => l.id === g.id))];
         if (allLearnings.length > 0) {
-          output.push(`## 💡 Learnings`);
+          output.push(`## Learnings`);
           allLearnings.slice(0, 5).forEach(l => output.push(`- [${l.category}] ${l.content}${l.project ? '' : ' (global)'}`));
           output.push('');
         }
 
-        // Recent errors
         if (errors.length > 0) {
-          output.push(`## 🐛 Recent Error Solutions`);
+          output.push(`## Recent Error Solutions`);
           errors.forEach(e => output.push(`- **${e.error_pattern}**: ${e.solution}`));
           output.push('');
         }
 
-        // Stats
         const stats = {
-          decisions: db.prepare("SELECT COUNT(*) as count FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
-          errors: db.prepare("SELECT COUNT(*) as count FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
-          learnings: db.prepare("SELECT COUNT(*) as count FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          decisions: await db.countTable("decisions", args.project),
+          errors: await db.countTable("errors", args.project),
+          learnings: await db.countTable("learnings", args.project),
           context: contextItems.length,
         };
-        output.push(`## 📊 Stats`);
+        output.push(`## Stats`);
         output.push(`Decisions: ${stats.decisions} | Errors: ${stats.errors} | Learnings: ${stats.learnings} | Context: ${stats.context}`);
+        output.push(`\nBackend: ${db.type}`);
 
         return { content: [{ type: "text", text: output.join('\n') }] };
       }
 
       case "load_comprehensive_memory": {
-        // Load comprehensive memory with higher limits for thorough session starts
         const includeGlobal = args.include_global !== false;
-        const useDecay = args.temporal_decay !== false; // default true
+        const useDecay = args.temporal_decay !== false;
 
-        // Higher limits for comprehensive loading
         const DECISION_LIMIT = 30;
         const LEARNING_LIMIT = 50;
         const ERROR_LIMIT = 15;
 
-        const sessions = getAllSessionsForProject.all(args.project);
-        const contextItems = getContext.all(args.project);
-        let decisions = getDecisions.all(args.project, DECISION_LIMIT);
-        let learnings = getLearnings.all(args.project, LEARNING_LIMIT);
-        let errors = getRecentErrors.all(args.project, ERROR_LIMIT);
+        const sessions = await db.getAllSessions(args.project);
+        const contextItems = await db.getContext(args.project);
+        let decisions = await db.getDecisions(args.project, DECISION_LIMIT);
+        let learnings = await db.getLearnings(args.project, LEARNING_LIMIT);
+        let errors = await db.getRecentErrors(args.project, ERROR_LIMIT);
 
-        // Apply temporal decay for sorting
         if (useDecay) {
           decisions = applyTemporalDecay(decisions, 'decisions', 'date');
           learnings = applyTemporalDecay(learnings, 'learnings');
           errors = applyTemporalDecay(errors, 'errors');
         }
 
-        // Get global context and learnings if requested
         let globalContext = [];
         let globalLearnings = [];
         if (includeGlobal) {
-          globalContext = getContext.all('global');
-          globalLearnings = db.prepare(
-            "SELECT * FROM learnings WHERE project IS NULL AND (archived IS NULL OR archived = 0) ORDER BY created_at DESC LIMIT 20"
-          ).all();
+          globalContext = await db.getContext('global');
+          globalLearnings = await db.getGlobalLearnings(20);
         }
 
         let output = [`# Comprehensive Memory for ${args.project}\n`];
-        output.push(`_Loaded with higher limits: ${DECISION_LIMIT} decisions, ${LEARNING_LIMIT} learnings, ${ERROR_LIMIT} errors_\n`);
+        output.push(`_Loaded with higher limits: ${DECISION_LIMIT} decisions, ${LEARNING_LIMIT} learnings, ${ERROR_LIMIT} errors | Backend: ${db.type}_\n`);
 
-        // Global context (if included)
         if (includeGlobal && globalContext.length > 0) {
-          output.push(`## 🌐 Global Context`);
+          output.push(`## Global Context`);
           globalContext.forEach(c => output.push(`- **${c.key}:** ${c.value}`));
           output.push('');
         }
 
-        // Session status (show all workspace sessions)
         if (sessions.length > 0) {
-          output.push(`## 📋 Active Sessions (${sessions.length})`);
+          output.push(`## Active Sessions (${sessions.length})`);
           for (const session of sessions) {
             const timeAgo = getTimeAgo(session.updated_at);
             const workspaceLabel = session.workspace ? `[${session.workspace}]` : '[default]';
@@ -1222,37 +930,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Project context
         if (contextItems.length > 0) {
-          output.push(`## ⚙️ Project Context (${contextItems.length} items)`);
+          output.push(`## Project Context (${contextItems.length} items)`);
           contextItems.forEach(c => output.push(`- **${c.key}:** ${c.value}`));
           output.push('');
         }
 
-        // Helper for priority indicator
-        const priorityIcon = (p) => p === 2 ? '🔴 ' : p === 1 ? '🟡 ' : '';
-
-        // Helper for memory tier classification (v2.7.0)
+        const priorityIcon = (p) => p === 2 ? '!! ' : p === 1 ? '! ' : '';
         const getTier = (item) => {
           const accessCount = item.access_count || 0;
           const lastAccessed = item.last_accessed ? new Date(item.last_accessed) : null;
           const now = new Date();
           const daysSinceAccess = lastAccessed ? (now - lastAccessed) / (1000 * 60 * 60 * 24) : Infinity;
-
-          // Hot: frequently accessed (5+) or recently accessed (7 days)
           if (accessCount >= 5 || daysSinceAccess <= 7) return 'hot';
-          // Warm: moderately accessed (2+) or accessed within 30 days
           if (accessCount >= 2 || daysSinceAccess <= 30) return 'warm';
-          // Cold: rarely or never accessed
           return 'cold';
         };
-        const tierIcon = (tier) => tier === 'hot' ? '🔥' : tier === 'warm' ? '⭐' : '';
+        const tierIcon = (tier) => tier === 'hot' ? '[HOT] ' : tier === 'warm' ? '[WARM] ' : '';
 
-        // Decisions (with dates and rationales)
         if (decisions.length > 0) {
           const highPriorityCount = decisions.filter(d => (d.priority || 0) > 0).length;
           const hotCount = decisions.filter(d => getTier(d) === 'hot').length;
-          output.push(`## 🎯 Decisions (${decisions.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
+          output.push(`## Decisions (${decisions.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
           decisions.forEach(d => {
             const categoryTag = d.category ? `[${d.category}] ` : '';
             const tier = tierIcon(getTier(d));
@@ -1263,7 +962,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           output.push('');
         }
 
-        // Learnings (project + global combined, deduplicated)
         let allLearnings = [...learnings];
         if (includeGlobal) {
           let globalLearningsToAdd = globalLearnings.filter(g => !allLearnings.find(l => l.id === g.id));
@@ -1272,14 +970,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           allLearnings.push(...globalLearningsToAdd);
         }
-        // Re-sort combined list by decay if enabled
         if (useDecay && allLearnings.length > 0) {
           allLearnings = applyTemporalDecay(allLearnings, 'learnings');
         }
         if (allLearnings.length > 0) {
           const highPriorityCount = allLearnings.filter(l => (l.priority || 0) > 0).length;
           const hotCount = allLearnings.filter(l => getTier(l) === 'hot').length;
-          output.push(`## 💡 Learnings (${allLearnings.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
+          output.push(`## Learnings (${allLearnings.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
           allLearnings.forEach(l => {
             const tier = tierIcon(getTier(l));
             const age = l._age ? ` _(${l._age})_` : '';
@@ -1288,11 +985,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           output.push('');
         }
 
-        // Error solutions
         if (errors.length > 0) {
           const highPriorityCount = errors.filter(e => (e.priority || 0) > 0).length;
           const hotCount = errors.filter(e => getTier(e) === 'hot').length;
-          output.push(`## 🐛 Error Solutions (${errors.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
+          output.push(`## Error Solutions (${errors.length}${highPriorityCount ? `, ${highPriorityCount} priority` : ''}${hotCount ? `, ${hotCount} hot` : ''})`);
           errors.forEach(e => {
             const categoryTag = e.category ? `[${e.category}] ` : '';
             const tier = tierIcon(getTier(e));
@@ -1304,47 +1000,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           output.push('');
         }
 
-        // Summary stats
         const stats = {
-          decisions: db.prepare("SELECT COUNT(*) as count FROM decisions WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
-          errors: db.prepare("SELECT COUNT(*) as count FROM errors WHERE project = ? AND (archived IS NULL OR archived = 0)").get(args.project).count,
-          learnings: db.prepare("SELECT COUNT(*) as count FROM learnings WHERE (project = ? OR project IS NULL) AND (archived IS NULL OR archived = 0)").get(args.project).count,
+          decisions: await db.countTable("decisions", args.project),
+          errors: await db.countTable("errors", args.project),
+          learnings: await db.countTable("learnings", args.project),
           context: contextItems.length,
         };
-        output.push(`## 📊 Total Available`);
+        output.push(`## Total Available`);
         output.push(`Decisions: ${stats.decisions} (loaded: ${decisions.length}) | Errors: ${stats.errors} (loaded: ${errors.length}) | Learnings: ${stats.learnings} (loaded: ${allLearnings.length}) | Context: ${stats.context}`);
 
         return { content: [{ type: "text", text: output.join('\n') }] };
       }
 
       case "archive": {
-        const tableMap = {
-          'decision': 'decisions',
-          'error': 'errors',
-          'learning': 'learnings',
-        };
+        const tableMap = { 'decision': 'decisions', 'error': 'errors', 'learning': 'learnings' };
         const table = tableMap[args.type];
         if (!table) {
           return { content: [{ type: "text", text: `Invalid type: ${args.type}. Use 'decision', 'error', or 'learning'` }] };
         }
 
-        const result = db.prepare(`UPDATE ${table} SET archived = 1 WHERE id = ?`).run(args.id);
+        const changes = await db.archive(table, args.id);
         return {
           content: [{
             type: "text",
-            text: result.changes > 0
-              ? `Archived ${args.type} #${args.id}`
-              : `No ${args.type} found with ID ${args.id}`
+            text: changes > 0 ? `Archived ${args.type} #${args.id}` : `No ${args.type} found with ID ${args.id}`
           }]
         };
       }
 
       case "set_priority": {
-        const tableMap = {
-          'decision': 'decisions',
-          'error': 'errors',
-          'learning': 'learnings',
-        };
+        const tableMap = { 'decision': 'decisions', 'error': 'errors', 'learning': 'learnings' };
         const table = tableMap[args.type];
         if (!table) {
           return { content: [{ type: "text", text: `Invalid type: ${args.type}. Use 'decision', 'error', or 'learning'` }] };
@@ -1356,11 +1041,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const priorityLabels = ['normal', 'high', 'critical'];
-        const result = db.prepare(`UPDATE ${table} SET priority = ? WHERE id = ?`).run(priority, args.id);
+        const changes = await db.setPriority(table, args.id, priority);
         return {
           content: [{
             type: "text",
-            text: result.changes > 0
+            text: changes > 0
               ? `Set ${args.type} #${args.id} priority to ${priorityLabels[priority]} (${priority})`
               : `No ${args.type} found with ID ${args.id}`
           }]
@@ -1370,51 +1055,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "prune": {
         const days = args.days || 90;
         const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-
-        let totalDeleted = 0;
-        const tables = ['decisions', 'errors', 'learnings'];
-
-        for (const table of tables) {
-          let query = `DELETE FROM ${table} WHERE archived = 1 AND created_at < ?`;
-          if (args.project !== 'all') {
-            query += ` AND project = ?`;
-          }
-
-          const result = args.project !== 'all'
-            ? db.prepare(query).run(cutoffDate, args.project)
-            : db.prepare(query).run(cutoffDate);
-
-          totalDeleted += result.changes;
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: `Pruned ${totalDeleted} archived items older than ${days} days`
-          }]
-        };
+        const totalDeleted = await db.prune(args.project, cutoffDate, ['decisions', 'errors', 'learnings']);
+        return { content: [{ type: "text", text: `Pruned ${totalDeleted} archived items older than ${days} days` }] };
       }
 
       case "export_memory": {
         const includeArchived = args.include_archived || false;
-        const archivedFilter = includeArchived ? '' : 'AND (archived IS NULL OR archived = 0)';
+        const data = await db.exportProject(args.project, includeArchived);
+        data.project = args.project;
+        data.exported_at = new Date().toISOString();
 
-        const data = {
-          project: args.project,
-          exported_at: new Date().toISOString(),
-          decisions: db.prepare(`SELECT * FROM decisions WHERE project = ? ${archivedFilter}`).all(args.project),
-          errors: db.prepare(`SELECT * FROM errors WHERE project = ? ${archivedFilter}`).all(args.project),
-          context: db.prepare(`SELECT * FROM context WHERE project = ?`).all(args.project),
-          learnings: db.prepare(`SELECT * FROM learnings WHERE project = ? ${archivedFilter}`).all(args.project),
-          session: getSession.get(args.project),
-        };
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(data, null, 2)
-          }]
-        };
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       case "import_memory": {
@@ -1422,47 +1073,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const data = JSON.parse(args.json_data);
           let imported = { decisions: 0, errors: 0, context: 0, learnings: 0 };
 
-          // Import decisions
           if (data.decisions) {
             for (const d of data.decisions) {
               try {
-                insertDecision.run(d.project, d.date, d.decision, d.rationale);
+                await db.insertDecision(d.project, d.date, d.decision, d.rationale, d.category || null);
                 imported.decisions++;
-              } catch (e) { /* skip duplicates */ }
+              } catch { /* skip duplicates */ }
             }
           }
 
-          // Import errors
           if (data.errors) {
             for (const e of data.errors) {
               try {
-                insertError.run(e.project, e.error_pattern, e.solution, e.context);
+                await db.insertError(e.project, e.error_pattern, e.solution, e.context, e.category || null);
                 imported.errors++;
-              } catch (e) { /* skip duplicates */ }
+              } catch { /* skip duplicates */ }
             }
           }
 
-          // Import context (upsert)
           if (data.context) {
             for (const c of data.context) {
-              upsertContext.run(c.project, c.key, c.value);
+              await db.upsertContext(c.project, c.key, c.value);
               imported.context++;
             }
           }
 
-          // Import learnings
           if (data.learnings) {
             for (const l of data.learnings) {
               try {
-                insertLearning.run(l.project, l.category, l.content);
+                await db.insertLearning(l.project, l.category, l.content);
                 imported.learnings++;
-              } catch (e) { /* skip duplicates */ }
+              } catch { /* skip duplicates */ }
             }
           }
 
-          // Import session
           if (data.session) {
-            upsertSession.run(data.session.project, data.session.task, data.session.status, data.session.notes);
+            await db.upsertSession(data.session.project, data.session.workspace || null, data.session.task, data.session.status, data.session.notes);
           }
 
           return {
@@ -1477,70 +1123,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "memory_stats": {
-        const { statSync } = await import("fs");
+        let output = [`# Memory Statistics\n`, `Backend: ${db.type}\n`];
 
-        // Get database file size
-        let dbSize = "unknown";
-        try {
-          const stats = statSync(dbPath);
-          const sizeKB = (stats.size / 1024).toFixed(2);
-          const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
-          dbSize = stats.size > 1024 * 1024 ? `${sizeMB} MB` : `${sizeKB} KB`;
-        } catch (e) { /* ignore */ }
-
-        let output = [`# Memory Statistics\n`, `Database size: ${dbSize}\n`];
+        if (db.type === "sqlite") {
+          try {
+            const { statSync } = await import("fs");
+            const stats = statSync(db.dbPath);
+            const sizeKB = (stats.size / 1024).toFixed(2);
+            const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
+            output.push(`Database size: ${stats.size > 1024 * 1024 ? `${sizeMB} MB` : `${sizeKB} KB`}\n`);
+          } catch { /* ignore */ }
+        }
 
         if (args.project) {
-          // Stats for specific project
-          const stats = {
-            decisions: db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived FROM decisions WHERE project = ?").get(args.project),
-            errors: db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived FROM errors WHERE project = ?").get(args.project),
-            learnings: db.prepare("SELECT COUNT(*) as total, SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived FROM learnings WHERE project = ?").get(args.project),
-            context: db.prepare("SELECT COUNT(*) as total FROM context WHERE project = ?").get(args.project),
-          };
-
-          output.push(`## Project: ${args.project}`);
-          output.push(`- Decisions: ${stats.decisions.total} (${stats.decisions.archived || 0} archived)`);
-          output.push(`- Errors: ${stats.errors.total} (${stats.errors.archived || 0} archived)`);
-          output.push(`- Learnings: ${stats.learnings.total} (${stats.learnings.archived || 0} archived)`);
-          output.push(`- Context keys: ${stats.context.total}`);
+          const stats = await db.getDetailedStats(args.project);
+          if (stats) {
+            output.push(`## Project: ${args.project}`);
+            output.push(`- Decisions: ${stats.decisions.total} (${stats.decisions.archived || 0} archived)`);
+            output.push(`- Errors: ${stats.errors.total} (${stats.errors.archived || 0} archived)`);
+            output.push(`- Learnings: ${stats.learnings.total} (${stats.learnings.archived || 0} archived)`);
+            output.push(`- Context keys: ${stats.context.total}`);
+          }
         } else {
-          // Stats for all projects
-          const projects = db.prepare(`
-            SELECT DISTINCT project FROM (
-              SELECT project FROM decisions
-              UNION SELECT project FROM errors
-              UNION SELECT project FROM context
-              UNION SELECT project FROM learnings WHERE project IS NOT NULL
-            ) ORDER BY project
-          `).all();
+          const projects = await db.getAllProjects();
 
           output.push(`## All Projects (${projects.length} total)\n`);
 
           for (const { project } of projects) {
-            const decisions = db.prepare("SELECT COUNT(*) as count FROM decisions WHERE project = ?").get(project).count;
-            const errors = db.prepare("SELECT COUNT(*) as count FROM errors WHERE project = ?").get(project).count;
-            const learnings = db.prepare("SELECT COUNT(*) as count FROM learnings WHERE project = ?").get(project).count;
-            const context = db.prepare("SELECT COUNT(*) as count FROM context WHERE project = ?").get(project).count;
-            output.push(`**${project}**: ${decisions} decisions, ${errors} errors, ${learnings} learnings, ${context} context`);
+            const s = await db.getProjectStats(project);
+            output.push(`**${project}**: ${s.decisions} decisions, ${s.errors} errors, ${s.learnings} learnings, ${s.context} context`);
           }
 
-          // Global learnings
-          const globalLearnings = db.prepare("SELECT COUNT(*) as count FROM learnings WHERE project IS NULL").get().count;
+          const globalLearnings = await db.getGlobalLearningsCount();
           output.push(`\n**Global learnings**: ${globalLearnings}`);
 
-          // Totals
           const totals = {
-            decisions: db.prepare("SELECT COUNT(*) as count FROM decisions").get().count,
-            errors: db.prepare("SELECT COUNT(*) as count FROM errors").get().count,
-            learnings: db.prepare("SELECT COUNT(*) as count FROM learnings").get().count,
-            context: db.prepare("SELECT COUNT(*) as count FROM context").get().count,
-            archived: db.prepare(`
-              SELECT
-                (SELECT COUNT(*) FROM decisions WHERE archived = 1) +
-                (SELECT COUNT(*) FROM errors WHERE archived = 1) +
-                (SELECT COUNT(*) FROM learnings WHERE archived = 1) as count
-            `).get().count,
+            decisions: await db.countTable("decisions", null, true),
+            errors: await db.countTable("errors", null, true),
+            learnings: await db.countTable("learnings", null, true),
+            context: await db.countTable("context", null, true),
+            archived: await db.getTotalArchived(),
           };
           output.push(`\n## Totals`);
           output.push(`- Total decisions: ${totals.decisions}`);
@@ -1555,77 +1177,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "bulk_cleanup": {
         const days = args.older_than_days;
-        const archivedOnly = args.archived_only !== false; // default true
+        const archivedOnly = args.archived_only !== false;
         const typeFilter = args.type || 'all';
         const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
         const tables = typeFilter === 'all'
           ? ['decisions', 'errors', 'learnings']
-          : [typeFilter];
+          : [typeFilter].filter(t => ['decisions', 'errors', 'learnings'].includes(t));
 
-        let totalDeleted = 0;
-        const deletedPerTable = {};
+        const { total, perTable } = await db.bulkCleanup(args.project, cutoffDate, tables, archivedOnly);
 
-        for (const table of tables) {
-          if (!['decisions', 'errors', 'learnings'].includes(table)) {
-            continue;
-          }
-
-          let conditions = ['created_at < ?'];
-          let params = [cutoffDate];
-
-          if (archivedOnly) {
-            conditions.push('archived = 1');
-          }
-
-          if (args.project !== 'all') {
-            conditions.push('project = ?');
-            params.push(args.project);
-          }
-
-          const query = `DELETE FROM ${table} WHERE ${conditions.join(' AND ')}`;
-          const result = db.prepare(query).run(...params);
-          deletedPerTable[table] = result.changes;
-          totalDeleted += result.changes;
-        }
-
-        const details = Object.entries(deletedPerTable)
+        const details = Object.entries(perTable)
           .map(([table, count]) => `${table}: ${count}`)
           .join(', ');
 
         return {
           content: [{
             type: "text",
-            text: `Deleted ${totalDeleted} items older than ${days} days${archivedOnly ? ' (archived only)' : ''}\n${details}`
+            text: `Deleted ${total} items older than ${days} days${archivedOnly ? ' (archived only)' : ''}\n${details}`
           }]
         };
       }
 
-      // Cloud sync tools (only available when Firestore is enabled)
+      // Cloud sync tools
       case "sync_to_cloud": {
         if (!firestoreSync) {
           return { content: [{ type: "text", text: "Firestore sync not enabled. Configure in ~/.claude/memory-config.json" }] };
         }
-
-        const tables = ["decisions", "errors", "context", "learnings", "sessions"];
+        // Firestore sync only works well with SQLite export
+        const tables = ["decisions", "errors", "context", "learnings"];
         let synced = 0;
-
         for (const table of tables) {
-          let query = `SELECT * FROM ${table}`;
-          if (args.project !== "all") {
-            query += ` WHERE project = ?`;
-          }
-
-          const rows = args.project !== "all"
-            ? db.prepare(query).all(args.project)
-            : db.prepare(query).all();
-
+          const data = await db.exportProject(args.project === "all" ? "%" : args.project, true);
+          const rows = data[table] || [];
           for (const row of rows) {
             await firestoreSync.syncToCloud(table, row);
             synced++;
           }
         }
-
         return { content: [{ type: "text", text: `Synced ${synced} records to Firestore` }] };
       }
 
@@ -1634,31 +1223,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "Firestore sync not enabled. Configure in ~/.claude/memory-config.json" }] };
         }
 
-        const tables = ["decisions", "errors", "context", "learnings", "sessions"];
+        const tables = ["decisions", "errors", "context", "learnings"];
         let pulled = 0;
 
         for (const table of tables) {
           const cloudRecords = await firestoreSync.pullFromCloud(table, args.project);
-
           for (const record of cloudRecords) {
-            // Merge cloud records into local DB (skip if newer local version exists)
-            // This is a simple last-write-wins strategy
             try {
               if (table === "decisions") {
-                insertDecision.run(record.project, record.date, record.decision, record.rationale);
+                await db.insertDecision(record.project, record.date, record.decision, record.rationale, record.category || null);
               } else if (table === "errors") {
-                insertError.run(record.project, record.error_pattern, record.solution, record.context);
+                await db.insertError(record.project, record.error_pattern, record.solution, record.context, record.category || null);
               } else if (table === "context") {
-                upsertContext.run(record.project, record.key, record.value);
+                await db.upsertContext(record.project, record.key, record.value);
               } else if (table === "learnings") {
-                insertLearning.run(record.project, record.category, record.content);
-              } else if (table === "sessions") {
-                upsertSession.run(record.project, record.task, record.status, record.notes);
+                await db.insertLearning(record.project, record.category, record.content);
               }
               pulled++;
-            } catch (e) {
-              // Likely a duplicate, skip
-            }
+            } catch { /* skip duplicates */ }
           }
         }
 
@@ -1675,12 +1257,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Start server
 async function main() {
-  // Initialize Firestore sync if configured
   firestoreSync = await initFirestoreSync();
+  db = await createDatabase(config);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`Claude Memory MCP server running (v2.3.0)${firestoreSync ? ' [Firestore enabled]' : ''}`);
+  console.error(`Claude Memory MCP server running (v3.0.0) [${db.type}]${firestoreSync ? ' [Firestore enabled]' : ''}`);
 }
 
 main().catch(console.error);
