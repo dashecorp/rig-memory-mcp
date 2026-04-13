@@ -56,11 +56,12 @@ async function initFirestoreSync() {
       async syncToCloud(table, data) {
         try {
           const docId = `${data.project || 'global'}_${data.id || Date.now()}`;
-          await firestore.collection(`${collectionPrefix}_${table}`).doc(docId).set({
-            ...data,
-            syncedAt: new Date().toISOString(),
-            machine: config.machineId || "unknown",
-          }, { merge: true });
+          // Strip undefined values — Firestore rejects them
+          const clean = Object.fromEntries(
+            Object.entries({ ...data, syncedAt: new Date().toISOString(), machine: config.machineId || "unknown" })
+              .filter(([, v]) => v !== undefined)
+          );
+          await firestore.collection(`${collectionPrefix}_${table}`).doc(docId).set(clean, { merge: true });
         } catch (e) {
           console.error(`Firestore sync error (${table}):`, e.message);
         }
