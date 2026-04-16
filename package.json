@@ -7,28 +7,29 @@
     "type": "git",
     "url": "https://github.com/dashecorp/rig-memory-mcp.git"
   },
-  "version": "1.0.0",
-  "description": "MCP memory server for the engineering rig — persistent agent memory across sessions",
+  "version": "2.0.0",
+  "description": "MCP memory server for the engineering rig — Postgres + pgvector backed persistent agent memory",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test.js"
   },
   "keywords": [
     "claude",
     "mcp",
     "memory",
     "claude-code",
-    "firestore"
+    "postgres",
+    "pgvector"
   ],
-  "author": "Stig-Johnny Stoebakk",
+  "author": "Dashecorp Engineering Rig",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
-    "better-sqlite3": "^12.8.0"
+    "pg": "^8.13.0"
   },
   "optionalDependencies": {
-    "@google-cloud/firestore": "^8.3.0",
-    "pg": "^8.13.0"
+    "openai": "^4.0.0"
   }
 }

@@ -6,12 +6,47 @@ on:
 
 jobs:
   check:
-    name: Validate
+    name: Validate & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: rig
+          POSTGRES_PASSWORD: rig
+          POSTGRES_DB: rig_memory_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check
+        run: node --check index.js db.js test.js
+
+      - name: Run integration tests
+        env:
+          DB_URL: postgres://rig:rig@localhost:5432/rig_memory_test
+          AGENT_ROLE: ci-test
+        run: node test.js
+
+  docker:
+    name: Docker build check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-      - run: npm ci
-      - run: node --check index.js
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t rig-memory-mcp:ci .
