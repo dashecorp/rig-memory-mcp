@@ -1,156 +1,74 @@
-# CLAUDE.md - Claude Memory MCP Server
+# CLAUDE.md — rig-memory-mcp
 
-This file provides guidance for Claude Code sessions working on the claude-memory-mcp project.
+MCP server providing persistent, searchable agent memory backed by Postgres + pgvector.
 
-## Project Overview
-
-**claude-memory-mcp** is a Model Context Protocol (MCP) server that provides persistent memory for Claude Code across sessions.
-
-**Tech Stack:**
-- Node.js (ES modules)
-- SQLite via better-sqlite3 (local storage)
-- Google Cloud Firestore (optional cloud sync)
-- MCP SDK (@modelcontextprotocol/sdk)
-
-**Repository:** https://github.com/Stig-Johnny/claude-memory-mcp
-
-## Project Structure
+## Project structure
 
 ```
-claude-memory-mcp/
-├── index.js              # Main MCP server (all logic in one file)
-├── package.json          # Dependencies and metadata
-├── memory-config.example.json  # Example config for Firestore
-├── README.md             # User documentation
-├── LICENSE               # MIT License
-└── CLAUDE.md             # This file
+rig-memory-mcp/
+├── index.js       # MCP server — tool definitions and handlers
+├── db.js          # Postgres layer — schema, queries
+├── test.js        # Integration tests (requires Postgres+pgvector)
+├── Dockerfile     # Production image (node:22-alpine)
+├── package.json
+├── README.md
+└── docs/
+    └── api.md     # Full tool API reference
 ```
 
-## How It Works
+## Tech stack
 
-1. **Local Storage**: SQLite database at `~/.claude/memory.db`
-2. **MCP Protocol**: Exposes tools via stdin/stdout for Claude Code
-3. **Cloud Sync** (optional): Syncs to Firestore when configured via `~/.claude/memory-config.json`
+| Component | Choice |
+|---|---|
+| Runtime | Node.js 22 (ES modules) |
+| DB | Postgres 16 + pgvector |
+| Text search | tsvector / ts_rank |
+| Vector search | pgvector cosine similarity (HNSW index) |
+| Embeddings | OpenAI text-embedding-3-small (optional) |
+| MCP SDK | @modelcontextprotocol/sdk |
 
-### Database Tables
-
-| Table | Purpose |
-|-------|---------|
-| `decisions` | Architectural decisions with rationale |
-| `errors` | Error patterns and their solutions |
-| `context` | Key-value project configuration |
-| `learnings` | Patterns, gotchas, best practices |
-| `sessions` | Work-in-progress session state |
-
-## Development
-
-### Running Locally
-
-The MCP server runs via Claude Code - it's not meant to be run standalone. To test:
-
-1. Update `~/.claude/settings.json` to point to your local copy
-2. Restart Claude Code
-3. Test the tools in a conversation
-
-### Making Changes
-
-Since this is a single-file MCP server:
-- All logic is in `index.js`
-- Database schema is created inline (lines ~115-170)
-- Tools are defined in the `ListToolsRequestSchema` handler
-- Tool implementations are in the `CallToolRequestSchema` handler
-
-### Testing Changes
-
-After modifying `index.js`:
-1. Restart Claude Code (the MCP server restarts with it)
-2. Test the affected tools manually
-
-## Key Design Decisions
+## Key design decisions
 
 | Decision | Rationale |
-|----------|-----------|
-| Single file (`index.js`) | Simple to understand and deploy |
-| SQLite for local storage | No external dependencies, persists across sessions |
-| Firestore for cloud sync | Works across machines, generous free tier |
-| Optional cloud sync | Works offline, cloud is opt-in |
-| Local-first architecture | Local SQLite is primary, Firestore is sync layer |
+|---|---|
+| Single `rig_memory` table | Unified schema across all memory types; scope/kind fields differentiate |
+| Generated tsvector column | No manual sync needed; always consistent with content |
+| HNSW index (not IVFFlat) | No training data required; better cold-start performance |
+| Embeddings optional | Server works without OPENAI_API_KEY; text search only |
+| hit_count + last_used_at | Tracks which memories are actually useful (mark_used metric) |
+| compact_repo groups by scope+kind | Groups related memories for meaningful summaries |
 
-## Common Tasks
+## Environment variables
 
-### Adding a New Tool
+| Var | Required | Description |
+|---|---|---|
+| `DB_URL` | ✅ | Postgres connection string |
+| `AGENT_ROLE` | ✅ | Agent's role (stamped on all writes) |
+| `WRITTEN_BY_AGENT` | — | Defaults to AGENT_ROLE |
+| `REPO` | — | Default repo for writes |
+| `OPENAI_API_KEY` | — | Enables embedding generation |
+| `OPENAI_BASE_URL` | — | Override OpenAI base URL |
 
-1. Add tool definition in `ListToolsRequestSchema` handler (~line 242)
-2. Add tool implementation in `CallToolRequestSchema` switch statement (~line 452)
-3. If it stores data, add Firestore sync call
-4. Update README.md with the new tool
-
-### Modifying Database Schema
-
-1. Add new table/column in the `db.exec()` block (~line 115)
-2. Add prepared statements if needed
-3. Consider migration for existing users (SQLite doesn't support all ALTER TABLE operations)
-
-### Updating Dependencies
+## Running tests
 
 ```bash
-npm update
-npm audit fix
+# Requires pgvector-enabled Postgres
+DB_URL=postgres://rig:rig@localhost/rig_memory_test AGENT_ROLE=test node test.js
 ```
 
-## 🧠 Persistent Memory
+CI uses `pgvector/pgvector:pg16` service container.
 
-This project uses itself for memory! Use project name `"claude-memory-mcp"`.
+## Adding a new tool
 
-### At Session Start
+1. Define it in `TOOLS` array in `index.js`
+2. Add a `case` in the `CallToolRequestSchema` handler
+3. Add DB helper in `db.js` if needed
+4. Add integration test in `test.js`
+5. Update `docs/api.md`
 
-```
-get_context(project: "claude-memory-mcp")
-recall_decisions(project: "claude-memory-mcp", limit: 5)
-```
+## Schema changes
 
-### What to Remember
+The schema is applied via `initSchema()` in `db.js` — it's idempotent (`CREATE IF NOT EXISTS`).
+For destructive changes, write a migration query and run it manually against production.
 
-- Version changes and release notes
-- Design decisions for the MCP architecture
-- Bug fixes that were non-obvious
-
-### Memory Maintenance (Keep Updated!)
-
-After making changes to any project, update memory immediately:
-
-| Change Type | Action |
-|-------------|--------|
-| New DB migration | Update `database_schema` context |
-| New API endpoint | Update `api_endpoints` context |
-| New file/module | Update `architecture_overview` context |
-| Version bump | `set_context(key: "sdk_version", value: "X.X.X")` |
-| Bug fix with lesson | `remember_learning(category: "gotcha", ...)` |
-| Architecture decision | `remember_decision(...)` |
-| Error solution found | `remember_error(...)` |
-
-**Triggers to watch for:**
-- Creating new source files
-- Adding routes or endpoints
-- Running database migrations
-- Fixing bugs that took significant time
-- Making decisions with trade-offs
-
-**At session end:** Verify memory is updated before closing.
-
-## Release Process
-
-1. Update version in `package.json`
-2. Update CHANGELOG (if we add one)
-3. Commit and push to main
-4. Users pull latest: `cd ~/.claude/mcp-servers/claude-memory && git pull`
-
-## Security Notes
-
-- Never commit `firestore-key.json` or `memory-config.json`
-- The `.gitignore` excludes `.db` files and sensitive configs
-- Users should never store actual secrets in memory (use env vars)
-
-## License
-
-MIT - see LICENSE file
+The `content_tsv` column is a generated column — never insert into it directly.

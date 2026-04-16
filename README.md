@@ -1,718 +1,185 @@
-# Claude Memory MCP Server
+# rig-memory-mcp
 
-A Model Context Protocol (MCP) server that provides persistent memory capabilities for Claude Code. Store decisions, error solutions, project context, learnings, and session state across conversations.
+MCP server providing persistent, searchable memory for the Dashecorp engineering rig agents. Backed by Postgres + pgvector with hybrid BM25 + vector search.
 
-## Features
-
-- **Decisions**: Track architectural and design decisions with rationale
-- **Error Solutions**: Store bug fixes and solutions for future reference
-- **Project Context**: Key-value storage for project-specific settings (SDK versions, URLs, etc.)
-- **Learnings**: Capture patterns, gotchas, and best practices
-- **Sessions**: Save and restore work session state
-- **Cloud Sync** (optional): Sync memory across machines using Google Cloud Firestore
-
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/Stig-Johnny/claude-memory-mcp.git ~/.claude/mcp-servers/claude-memory
-
-# 2. Install dependencies
-cd ~/.claude/mcp-servers/claude-memory
-npm install
-
-# 3. Install the slash command (optional but recommended)
-mkdir -p ~/.claude/commands
-cp ~/.claude/mcp-servers/claude-memory/commands/load-memory.md ~/.claude/commands/
-
-# 4. Add to Claude Code settings (~/.claude/settings.json)
+docker run --rm \
+  -e DB_URL=postgres://user:pass@host/db \
+  -e AGENT_ROLE=dev-e \
+  ghcr.io/dashecorp/rig-memory-mcp:latest
 ```
 
-Add this to your `~/.claude/settings.json`:
+Or with Node:
+
+```bash
+npm install
+DB_URL=postgres://... AGENT_ROLE=dev-e node index.js
+```
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DB_URL` | ✅ | — | Postgres connection string |
+| `AGENT_ROLE` | ✅ | — | Role of the agent (e.g. `dev-e`, `review-e`) |
+| `WRITTEN_BY_AGENT` | — | `AGENT_ROLE` | Override agent name for writes |
+| `REPO` | — | `""` | Default repo slug for `write_memory` |
+| `OPENAI_API_KEY` | — | — | Enables semantic embeddings (text-embedding-3-small) |
+| `OPENAI_BASE_URL` | — | OpenAI default | Override base URL for OpenAI-compatible endpoints |
+
+Without `OPENAI_API_KEY`, the server runs in **text-only mode** (BM25/tsvector search only).
+
+## Database schema
+
+```sql
+CREATE TABLE rig_memory (
+  id              UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_role      TEXT        NOT NULL,
+  written_by_agent TEXT       NOT NULL,
+  repo            TEXT        NOT NULL,
+  issue_id        INT,
+  scope           TEXT        NOT NULL,
+  kind            TEXT        NOT NULL,
+  title           TEXT        NOT NULL,
+  content         TEXT        NOT NULL,
+  tags            TEXT[]      NOT NULL DEFAULT '{}',
+  importance      SMALLINT    NOT NULL DEFAULT 3,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at      TIMESTAMPTZ,
+  hit_count       INT         NOT NULL DEFAULT 0,
+  last_used_at    TIMESTAMPTZ,
+  embedding       VECTOR(1536),
+  content_tsv     TSVECTOR    GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || content)) STORED
+);
+```
+
+Requires Postgres 12+ and [pgvector](https://github.com/pgvector/pgvector) extension.
+
+### Indexes
+
+| Index | Type | Purpose |
+|---|---|---|
+| `idx_rm_content_tsv` | GIN | Full-text search (tsvector) |
+| `idx_rm_embedding` | HNSW | Vector cosine search |
+| `idx_rm_repo` | B-tree | Repo filter |
+| `idx_rm_agent_role` | B-tree | Agent filter |
+| `idx_rm_created_at` | B-tree | Recency queries |
+
+## MCP tools
+
+### `write_memory`
+
+Store a memory. Agent identity and default repo come from env vars.
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `scope` | string | ✅ | e.g. `session`, `project`, `repo`, `global` |
+| `kind` | string | ✅ | e.g. `decision`, `error`, `learning`, `pattern` |
+| `title` | string | ✅ | Short searchable title (≤ 120 chars) |
+| `content` | string | ✅ | Full memory content |
+| `tags` | string[] | — | Tags for filtering |
+| `importance` | number | — | 1–5, default 3 |
+| `repo` | string | — | Override default repo |
+| `issue_id` | number | — | GitHub issue number |
+| `expires_at` | string | — | ISO-8601 expiry timestamp |
+
+### `read_memories`
+
+Hybrid search (BM25 tsvector + cosine vector similarity). Returns up to `limit` ranked results.
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `query` | string | ✅ | Natural-language search query |
+| `agent_role` | string | — | Filter by agent role |
+| `repo` | string | — | Filter by repo slug |
+| `issue_id` | number | — | Filter by issue number |
+| `limit` | number | — | Max results (default 20) |
+
+Results include `hybrid_score`, `text_score`, `vec_score` fields.
+
+### `list_recent`
+
+Return most-recently written memories for an agent/repo.
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `agent_role` | string | — | Filter by agent role |
+| `repo` | string | — | Filter by repo slug |
+| `limit` | number | — | Max results (default 10) |
+
+### `mark_used`
+
+Increment `hit_count` on a memory and set `last_used_at`. Call this when a retrieved memory was actually helpful.
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `memory_id` | string | ✅ | UUID of the memory |
+
+### `compact_repo`
+
+Summarize and prune old memories for a repo. Groups entries by `scope`+`kind`, collapses groups into one summary memory, deletes originals. Also purges expired entries.
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `repo` | string | ✅ | Repo slug to compact |
+| `older_than_days` | number | — | Only compact memories older than N days (default 30) |
+
+## Hybrid search
+
+When `OPENAI_API_KEY` is set, each write embeds `title + content` using `text-embedding-3-small` (1536 dims). Search combines:
+
+```
+hybrid_score = text_rank × 0.35 + (1 − cosine_distance) × 0.65
+```
+
+Without embeddings, search falls back to tsvector-only (`ts_rank`).
+
+## Running with Claude Code
+
+Add to `~/.claude/settings.json`:
 
 ```json
 {
   "mcpServers": {
-    "claude-memory": {
-      "command": "node",
-      "args": ["/Users/YOUR_USERNAME/.claude/mcp-servers/claude-memory/index.js"]
+    "rig-memory": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "DB_URL",
+        "-e", "AGENT_ROLE",
+        "-e", "OPENAI_API_KEY",
+        "ghcr.io/dashecorp/rig-memory-mcp:latest"
+      ],
+      "env": {
+        "DB_URL": "postgres://...",
+        "AGENT_ROLE": "dev-e",
+        "OPENAI_API_KEY": "sk-..."
+      }
     }
   }
 }
 ```
 
-Replace `YOUR_USERNAME` with your actual username (run `whoami` to check).
-
-**5. Restart Claude Code** to load the MCP server.
-
----
-
-## Slash Command: /load-memory
-
-The included `/load-memory` command makes it easy to load all context at session start.
-
-### Usage
-
-```
-/load-memory my-project
-```
-
-This loads:
-1. Global context (user info, preferences)
-2. Project context (URLs, versions, config)
-3. Saved session state (if any)
-4. Recent decisions (last 10)
-5. Recent learnings (last 10)
-
-### Installation
-
-The slash command is installed in Step 3 of Quick Start. If you skipped it:
+## Development
 
 ```bash
-mkdir -p ~/.claude/commands
-cp ~/.claude/mcp-servers/claude-memory/commands/load-memory.md ~/.claude/commands/
+# Install deps
+npm install
+
+# Run integration tests (requires Postgres with pgvector)
+DB_URL=postgres://rig:rig@localhost/rig_memory_test AGENT_ROLE=test node test.js
+
+# Start with Docker Compose (spins up pgvector locally)
+docker compose up
 ```
 
-### Per-Project Customization
+## Docker
 
-You can create project-specific load commands. Copy to your project's `.claude/commands/`:
-
-```bash
-mkdir -p /path/to/your-project/.claude/commands
-cp ~/.claude/mcp-servers/claude-memory/commands/load-memory.md /path/to/your-project/.claude/commands/
-```
-
-Then customize it with project-specific instructions (e.g., set an assistant persona, add project-specific reminders).
-
----
-
-## Database Location
-
-The SQLite database is stored at `~/.claude/memory.db`. This file persists across Claude Code sessions.
-
----
-
-## Integrating with Your Project's CLAUDE.md
-
-To get the most out of claude-memory, add instructions to your project's `CLAUDE.md` file so Claude knows when and how to use the memory tools.
-
-### Recommended CLAUDE.md Section
-
-Add this to your project's `CLAUDE.md`:
-
-```markdown
-## 🧠 Persistent Memory (MCP)
-
-This project uses the claude-memory MCP for cross-session context.
-
-### At Session Start
-
-Always recall context at the beginning of each session:
-
-mcp__claude-memory__get_session(project: "my-project")
-mcp__claude-memory__get_context(project: "my-project")
-mcp__claude-memory__recall_decisions(project: "my-project", limit: 5)
-
-### What to Store
-
-| Type | Tool | When to Use |
-|------|------|-------------|
-| Config/URLs/versions | `set_context` | SDK versions, API URLs, bundle IDs |
-| Architectural choices | `remember_decision` | Decisions with trade-offs worth documenting |
-| Bug solutions | `remember_error` | Non-trivial bugs you might encounter again |
-| Patterns/gotchas | `remember_learning` | Tips that save time |
-| Work state | `save_session` | Before ending a session mid-task |
-
-### Before Ending a Session (if work is incomplete)
-
-save_session(
-  project: "my-project",
-  task: "What you were working on",
-  status: "in-progress",
-  notes: "Next steps to resume..."
-)
-
-### When Task is Complete
-
-clear_session(project: "my-project")
-```
-
-### Example: Real-World CLAUDE.md Integration
-
-Here's a more complete example from a production project:
-
-```markdown
-## 🧠 Persistent Memory
-
-### At Session Start
-Always run these to load context:
-- `get_context(project: "my-app")` - Get SDK versions, URLs, config
-- `recall_decisions(project: "my-app", limit: 10)` - Recent architectural decisions
-- `get_session(project: "my-app")` - Check for unfinished work
-
-### What to Remember
-
-**Store context for:**
-- `sdk_version` - Current SDK version number
-- `api_url` - Production API endpoint
-- `bundle_id` - iOS/Android bundle identifier
-
-**Store decisions when:**
-- Choosing between technologies (e.g., "Use SQLite over CoreData")
-- Making trade-offs (e.g., "Polling vs WebSockets")
-- Establishing patterns (e.g., "All API calls go through ApiClient")
-
-**Store errors when:**
-- The fix wasn't obvious
-- You might encounter it again
-- It took significant debugging time
-```
-
-### Memory Maintenance (Keep Updated!)
-
-To keep memory useful, update it immediately after making changes:
-
-| Change Type | Action |
-|-------------|--------|
-| New DB migration | Update `database_schema` context with new tables/columns |
-| New API endpoint | Update `api_endpoints` context with new route |
-| New file/module | Update `architecture_overview` context |
-| Version bump | `set_context(key: "sdk_version", value: "X.X.X")` |
-| Bug fix with lesson | `remember_learning(category: "gotcha", ...)` |
-| Architecture decision | `remember_decision(decision: "...", rationale: "...")` |
-| Error solution found | `remember_error(error_pattern: "...", solution: "...")` |
-
-**Triggers to watch for:**
-- Creating new source files
-- Adding routes or endpoints
-- Running or creating database migrations
-- Fixing bugs that took significant debugging time
-- Making decisions with trade-offs
-
-**At session end:** If significant changes were made, verify memory is updated before closing.
-
----
-
-## Temporal Decay (NEW in v2.2)
-
-Memory retrieval now supports **temporal decay** - results are weighted by recency so that recent memories surface first, while older ones gradually fade in relevance.
-
-### How It Works
-
-Each memory type has a different decay rate based on typical lifespan:
-
-| Type | Half-life | Rationale |
-|------|-----------|-----------|
-| Decisions | ~350 days | Architecture decisions stay relevant long-term |
-| Learnings | ~140 days | Patterns and gotchas fade as codebases evolve |
-| Errors | ~70 days | Error solutions become stale fastest (deps change, APIs update) |
-
-The decay formula is exponential: `score = e^(-λ × days_since_created)`. Priority is still respected first (critical > high > normal), then decay determines order within the same priority tier.
-
-### Default Behavior
-
-| Tool | Temporal Decay Default | Reason |
-|------|----------------------|--------|
-| `recall_decisions` | **Off** | Decisions are durable by nature |
-| `recall_learnings` | **On** | Recent patterns more relevant |
-| `find_solution` | **On** | Recent solutions more likely to work |
-| `search_all` | **On** | Recency matters in general search |
-| `load_comprehensive_memory` | **On** | Session starts benefit from recent-first ordering |
-
-### Usage
+Images are published to GHCR on every push to `main`:
 
 ```
-# Explicit opt-in for decisions
-recall_decisions(project: "my-app", temporal_decay: true)
-
-# Opt-out for learnings (use default ordering: priority, then newest-first)
-recall_learnings(project: "my-app", temporal_decay: false)
-
-# search_all uses decay by default
-search_all(project: "my-app", query: "authentication")
+ghcr.io/dashecorp/rig-memory-mcp:latest
+ghcr.io/dashecorp/rig-memory-mcp:sha-<commit>
 ```
-
-Results include age indicators like `(3d ago)`, `(2mo ago)`, `(1y ago)` when temporal decay is active.
-
----
-
-## Best Practices
-
-### Project Naming
-
-Use consistent, short project names:
-- ✅ `"my-app"` - short and clear
-- ✅ `"my-app-ios"` - for related sub-projects
-- ❌ `"My Application Project"` - too long
-
-### Context Keys Convention
-
-Use snake_case for context keys:
-- `sdk_version`
-- `api_url`
-- `bundle_id`
-- `production_api_key`
-
-### What to Store vs. What NOT to Store
-
-**DO store:**
-- SDK versions, API URLs, bundle IDs
-- Architectural decisions with rationale
-- Non-obvious bug fixes
-- Project-specific gotchas and patterns
-
-**DON'T store:**
-- Temporary debugging info
-- Obvious/trivial fixes
-- Secrets or credentials (use environment variables instead!)
-- Information that changes every session
-
----
-
-## Usage Examples
-
-### Remember a Decision
-
-```
-remember_decision(
-  project: "my-app",
-  decision: "Use RevenueCat for subscription management",
-  rationale: "Handles receipt validation, cross-platform, and reduces server-side complexity"
-)
-```
-
-### Recall Past Decisions
-
-```
-recall_decisions(project: "my-app", limit: 5)
-# Returns most recent decisions, optionally filtered by keyword:
-recall_decisions(project: "my-app", search: "authentication")
-```
-
-### Session Continuity: Save and Resume
-
-Save before ending a session mid-task:
-
-```
-save_session(
-  project: "my-app",
-  task: "Implementing push notifications",
-  status: "in-progress",
-  notes: "APNs cert done. Still need: device token registration, topic routing"
-)
-```
-
-Resume next session:
-
-```
-get_session(project: "my-app")
-# Returns task, status, and notes from last saved session
-```
-
-When done:
-
-```
-clear_session(project: "my-app")
-```
-
----
-
-## Workflow Examples
-
-### Starting a New Session
-
-```
-get_session(project: "my-app")              # Check for unfinished work
-get_context(project: "my-app")              # Load project config
-recall_decisions(project: "my-app", limit: 5)  # Recent decisions
-```
-
-### After Fixing a Tricky Bug
-
-```
-remember_error(
-  project: "my-app",
-  error_pattern: "SQLITE_CONSTRAINT: UNIQUE constraint failed",
-  solution: "Use INSERT OR REPLACE instead of INSERT for upserts",
-  context: "When upserting records in SQLite/D1"
-)
-```
-
-### After Making an Architectural Decision
-
-```
-remember_decision(
-  project: "my-app",
-  decision: "Use polling instead of WebSockets for real-time updates",
-  rationale: "WebSockets add complexity; our updates are infrequent (30s interval is acceptable)"
-)
-```
-
-### Storing Project Configuration
-
-```
-set_context(project: "my-app", key: "sdk_version", value: "2.1.0")
-set_context(project: "my-app", key: "api_url", value: "https://api.my-app.com")
-set_context(project: "my-app", key: "min_ios_version", value: "15.0")
-```
-
-### Before Ending a Session Mid-Task
-
-```
-save_session(
-  project: "my-app",
-  task: "Implementing user authentication",
-  status: "in-progress",
-  notes: "JWT generation done. Still need: refresh tokens, logout endpoint, token expiry handling"
-)
-```
-
-### When Task is Complete
-
-```
-clear_session(project: "my-app")
-```
-
-### Searching for Past Solutions
-
-```
-find_solution(project: "my-app", error: "UNIQUE constraint")
-search_all(project: "my-app", query: "authentication")
-```
-
-### Quick Session Start (NEW in v2.1)
-
-Instead of calling multiple tools, use `memory_status` for a comprehensive overview:
-
-```
-memory_status(project: "my-app")
-```
-
-Returns: active session, all context, recent decisions, learnings, error solutions, and stats in one call.
-
-### Archiving Old Data
-
-```
-# Archive a specific decision (still in DB but hidden from queries)
-archive(type: "decision", id: 42)
-
-# Archive an error solution
-archive(type: "error", id: 15)
-
-# Permanently delete archived items older than 90 days
-prune(project: "my-app", days: 90)
-
-# Prune all projects
-prune(project: "all", days: 90)
-```
-
-### Export / Import Memory
-
-```
-# Export project memory to JSON
-export_memory(project: "my-app")
-
-# Export including archived items
-export_memory(project: "my-app", include_archived: true)
-
-# Import from JSON (merges with existing data)
-import_memory(json_data: '{"decisions": [...], "context": [...]}')
-```
-
----
-
-## Cloud Sync with Firestore (Multi-Machine Setup)
-
-To sync your memory across multiple machines (e.g., home and work computers), set up Firestore:
-
-### Step 1: Create Firebase Project
-
-1. Go to [Firebase Console](https://console.firebase.google.com/)
-2. Click **"Create a project"**
-3. Name it (e.g., `claude-memory-mcp`)
-4. Disable Google Analytics (not needed)
-5. Click **Create**
-
-### Step 2: Create Firestore Database
-
-1. In Firebase Console, go to **Build → Firestore Database**
-2. Click **"Create database"**
-3. Choose **"Start in test mode"** (we'll secure it later)
-4. Select a location:
-   - `eur3` (Europe) - if you're in Europe
-   - `nam5` (US) - if you're in the US
-5. Click **Create**
-
-### Step 3: Get Service Account Key
-
-1. Go to **Project Settings** (gear icon) → **Service accounts** tab
-2. Click **"Generate new private key"**
-3. Save the downloaded JSON file to `~/.claude/firestore-key.json`
-
-### Step 4: Create Config File
-
-Create `~/.claude/memory-config.json`:
-
-```json
-{
-  "machineId": "my-macbook",
-  "firestore": {
-    "enabled": true,
-    "projectId": "claude-memory-mcp",
-    "keyFilePath": "/Users/YOUR_USERNAME/.claude/firestore-key.json",
-    "collectionPrefix": "claude-memory"
-  }
-}
-```
-
-**Important:**
-- Replace `YOUR_USERNAME` with your actual username
-- Replace `claude-memory-mcp` with your Firebase project ID
-- Use a unique `machineId` for each computer (e.g., `macbook-home`, `macbook-work`)
-
-### Step 5: Install Firestore Package
-
-```bash
-cd ~/.claude/mcp-servers/claude-memory
-npm install @google-cloud/firestore
-```
-
-### Step 6: Restart Claude Code
-
-Quit and reopen Claude Code. You should see `(synced)` after memory operations.
-
-### Setting Up Additional Machines
-
-On each additional machine:
-
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/Stig-Johnny/claude-memory-mcp.git ~/.claude/mcp-servers/claude-memory
-   cd ~/.claude/mcp-servers/claude-memory
-   npm install
-   npm install @google-cloud/firestore
-   ```
-
-2. Copy these files from your first machine:
-   - `~/.claude/firestore-key.json` (same key works on all machines)
-   - `~/.claude/memory-config.json` (change `machineId` to be unique!)
-
-3. Add MCP server to `~/.claude/settings.json` (same as Step 3 in Quick Start)
-
-4. Restart Claude Code
-
-### How Sync Works
-
-- **Automatic sync on write**: When you store a decision, error, or context, it saves locally AND syncs to Firestore
-- **Manual sync**: Use `sync_to_cloud` to push all local data, `pull_from_cloud` to fetch from cloud
-- **Local-first**: Local SQLite is the primary database; Firestore is for cross-machine sync
-- **Offline capable**: Works offline, syncs when connected
-
----
-
-## Available Tools
-
-### Decision Management
-
-| Tool | Description |
-|------|-------------|
-| `remember_decision` | Store a project decision with rationale |
-| `recall_decisions` | Retrieve past decisions (with optional search) |
-
-### Error Solutions
-
-| Tool | Description |
-|------|-------------|
-| `remember_error` | Store an error pattern and its solution |
-| `find_solution` | Search for solutions to an error |
-| `list_errors` | List all stored errors for a project |
-
-### Project Context
-
-| Tool | Description |
-|------|-------------|
-| `set_context` | Store a key-value pair for a project |
-| `get_context` | Get stored context (all keys or specific key) |
-| `delete_context` | Remove a context key |
-
-### Learnings
-
-| Tool | Description |
-|------|-------------|
-| `remember_learning` | Store a learning (pattern, gotcha, best-practice) |
-| `recall_learnings` | Retrieve past learnings |
-
-### Session Management
-
-| Tool | Description |
-|------|-------------|
-| `save_session` | Save current work state before ending |
-| `get_session` | Resume from last saved session |
-| `clear_session` | Clear session when work is complete |
-| `memory_status` | **NEW** Get comprehensive summary for session start (context, decisions, learnings, errors, stats) |
-
-### Search
-
-| Tool | Description |
-|------|-------------|
-| `search_all` | Search across all memory types |
-
-### Maintenance
-
-| Tool | Description |
-|------|-------------|
-| `archive` | **NEW** Archive old items by ID (won't appear in queries but not deleted) |
-| `prune` | **NEW** Permanently delete archived items older than N days |
-| `export_memory` | **NEW** Export all project memory to JSON |
-| `import_memory` | **NEW** Import memory from JSON (merges with existing) |
-
-### Cloud Sync (when Firestore enabled)
-
-| Tool | Description |
-|------|-------------|
-| `sync_to_cloud` | Push local memory to Firestore |
-| `pull_from_cloud` | Pull memory from Firestore |
-
----
-
-## Usage Examples
-
-### 1. Remember a Decision
-
-Store an architectural choice with rationale so future sessions know why it was made:
-
-```
-remember_decision(
-  project: "my-app",
-  decision: "Use SQLite over CoreData for local persistence",
-  rationale: "Simpler schema migrations, easier to inspect, no ORM overhead for our use case"
-)
-```
-
-### 2. Recall Past Decisions
-
-Query stored decisions at the start of a session or before making related changes:
-
-```
-recall_decisions(project: "my-app", limit: 5)
-# Returns: recent decisions with rationale, timestamps, and priority
-```
-
-### 3. Save Session State (mid-task)
-
-Preserve work-in-progress before ending a session so the next session can resume instantly:
-
-```
-save_session(
-  project: "my-app",
-  task: "Implementing push notifications",
-  status: "in-progress",
-  notes: "APNs registration done. Remaining: badge count sync, deep-link routing on tap"
-)
-```
-
-### 4. Resume a Session
-
-At the start of a new session, check for unfinished work and load project context together:
-
-```
-get_session(project: "my-app")
-# → Restores task, status, and notes from last save_session call
-
-get_context(project: "my-app")
-# → Returns stored config: SDK version, API URLs, bundle ID, etc.
-```
-
-When the task is complete, clear the session:
-
-```
-clear_session(project: "my-app")
-```
-
----
-
-## Multi-Project Support
-
-Memory is organized by project name. Use consistent project names across sessions:
-
-- `"my-app"` - Main application
-- `"my-app-sdk"` - Related SDK
-- `null` (for learnings) - Global learnings shared across all projects
-
----
-
-## Backup and Migration
-
-### Backup
-
-```bash
-cp ~/.claude/memory.db ~/.claude/memory.db.backup
-```
-
-### View Data with SQLite
-
-```bash
-sqlite3 ~/.claude/memory.db
-.tables
-SELECT * FROM decisions WHERE project = 'my-project';
-```
-
-### Export All Local Data to Firestore
-
-If you have existing local data and want to migrate to cloud:
-
-```
-sync_to_cloud(project: "all")
-```
-
----
-
-## Troubleshooting
-
-### Firestore Not Syncing (no "(synced)" message)
-
-1. **Restart Claude Code** after creating the config file
-2. Check config file exists and is valid:
-   ```bash
-   cat ~/.claude/memory-config.json | python3 -m json.tool
-   ```
-3. Check Firestore package is installed:
-   ```bash
-   cd ~/.claude/mcp-servers/claude-memory
-   npm list @google-cloud/firestore
-   ```
-
-### Permission Denied Error
-
-Make sure your service account has the "Cloud Datastore User" role:
-1. Go to [GCP IAM Console](https://console.cloud.google.com/iam-admin/iam)
-2. Find your service account (ends with `@your-project.iam.gserviceaccount.com`)
-3. Add "Cloud Datastore User" role
-
-### Key File Not Found
-
-Verify the path in `memory-config.json` matches where you saved the key:
-```bash
-ls -la ~/.claude/firestore-key.json
-```
-
----
-
-## Security Notes
-
-- **Keep `firestore-key.json` private** - never commit it to Git
-- The service account key has access to your Firestore database
-- Firebase "test mode" rules expire after 30 days - [set up proper rules](https://firebase.google.com/docs/firestore/security/get-started) for production
-- **Never store secrets** (API keys, passwords) in memory - use environment variables
-
----
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
----
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.

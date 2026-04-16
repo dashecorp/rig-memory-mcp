@@ -1,12 +1,6 @@
 # Dependencies
 node_modules/
 
-# Database (local data - don't commit)
-*.db
-*.db-journal
-*.db-shm
-*.db-wal
-
 # OS files
 .DS_Store
 Thumbs.db
