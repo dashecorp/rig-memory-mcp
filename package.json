@@ -1,7 +1,7 @@
 {
-  "name": "claude-memory-mcp",
-  "version": "1.1.0",
-  "description": "MCP server for Claude Code persistent memory with optional Firestore cloud sync",
+  "name": "rig-memory-mcp",
+  "version": "1.0.0",
+  "description": "MCP memory server for the engineering rig — persistent agent memory across sessions",
   "type": "module",
   "main": "index.js",
   "scripts": {
