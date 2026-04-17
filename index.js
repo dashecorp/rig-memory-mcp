@@ -34,7 +34,7 @@ import {
   compactRepo,
   createSqliteBackend,
 } from "./db.js";
-import { emitEvent } from "./events.js";
+import { emitMemoryWrite, emitMemoryRead, emitMemoryHitUsed } from "./events.js";
 
 // ---------- Config ----------
 
@@ -347,15 +347,13 @@ async function main() {
             embedding,
           });
 
-          emitEvent("memory_written", {
-            memoryId: id,
+          emitMemoryWrite({
             repo,
-            issueId: args.issue_id ?? null,
+            issueId: args.issue_id ?? 0,
             scope: args.scope,
             kind: args.kind,
-            title: args.title,
-            importance: args.importance ?? 3,
-            embedded: embedding !== null,
+            memoryId: id,
+            tokens: approxTokens(args.title, args.content),
           });
 
           return ok({
@@ -377,13 +375,12 @@ async function main() {
             embedding,
           });
 
-          emitEvent("memory_read", {
+          emitMemoryRead({
+            repo: args.repo || "",
+            issueId: args.issue_id ?? 0,
             query: args.query,
-            repoFilter: args.repo ?? null,
-            agentRoleFilter: args.agent_role ?? null,
-            issueIdFilter: args.issue_id ?? null,
-            resultCount: rows.length,
-            mode: embedding ? "hybrid" : "text-only",
+            hits: rows.length,
+            tokensLoaded: rows.reduce((n, r) => n + approxTokens(r.title, r.content), 0),
           });
 
           return ok({
@@ -400,11 +397,8 @@ async function main() {
             limit: args.limit ?? 10,
           });
 
-          emitEvent("memory_listed", {
-            repoFilter: args.repo ?? null,
-            agentRoleFilter: args.agent_role ?? null,
-            resultCount: rows.length,
-          });
+          // Conductor-E has no matching event type for list_recent today.
+          // Add a MEMORY_LISTED record there if we want dashboard visibility.
 
           return ok({
             memories: rows.map(formatMemory),
@@ -415,10 +409,12 @@ async function main() {
         case "mark_used": {
           const found = await backend.markUsed(args.memory_id);
 
-          emitEvent("memory_used", {
-            memoryId: args.memory_id,
-            found,
-          });
+          if (found) {
+            emitMemoryHitUsed({
+              memoryId: args.memory_id,
+              usedInOutput: true,
+            });
+          }
 
           return ok({ found, memory_id: args.memory_id });
         }
@@ -431,12 +427,8 @@ async function main() {
             written_by_agent: WRITTEN_BY_AGENT,
           });
 
-          emitEvent("memory_compacted", {
-            repo: args.repo,
-            olderThanDays: args.older_than_days ?? 30,
-            deleted: result.deleted,
-            summariesCreated: result.summaries_created,
-          });
+          // Conductor-E has no MEMORY_COMPACTED record type today — add one there
+          // if compaction activity becomes observability-relevant.
 
           return ok({
             repo: args.repo,
@@ -464,6 +456,15 @@ async function main() {
 }
 
 // ---------- Helpers ----------
+
+/**
+ * Rough token count: ~4 characters ≈ 1 token (OpenAI/Claude tokenizer heuristic).
+ * Used only for telemetry ballpark — exact count doesn't matter.
+ */
+function approxTokens(...parts) {
+  const chars = parts.filter(Boolean).join(" ").length;
+  return Math.ceil(chars / 4);
+}
 
 function ok(data) {
   return {

@@ -7,7 +7,7 @@
     "type": "git",
     "url": "https://github.com/dashecorp/rig-memory-mcp.git"
   },
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "MCP memory server for the engineering rig — Postgres+pgvector primary, SQLite fallback",
   "type": "module",
   "main": "index.js",
