@@ -34,6 +34,7 @@ import {
   compactRepo,
   createSqliteBackend,
 } from "./db.js";
+import { emitEvent } from "./events.js";
 
 // ---------- Config ----------
 
@@ -346,6 +347,17 @@ async function main() {
             embedding,
           });
 
+          emitEvent("memory_written", {
+            memoryId: id,
+            repo,
+            issueId: args.issue_id ?? null,
+            scope: args.scope,
+            kind: args.kind,
+            title: args.title,
+            importance: args.importance ?? 3,
+            embedded: embedding !== null,
+          });
+
           return ok({
             id,
             message: `Memory saved (id: ${id})`,
@@ -365,6 +377,15 @@ async function main() {
             embedding,
           });
 
+          emitEvent("memory_read", {
+            query: args.query,
+            repoFilter: args.repo ?? null,
+            agentRoleFilter: args.agent_role ?? null,
+            issueIdFilter: args.issue_id ?? null,
+            resultCount: rows.length,
+            mode: embedding ? "hybrid" : "text-only",
+          });
+
           return ok({
             memories: rows.map(formatMemory),
             total: rows.length,
@@ -379,6 +400,12 @@ async function main() {
             limit: args.limit ?? 10,
           });
 
+          emitEvent("memory_listed", {
+            repoFilter: args.repo ?? null,
+            agentRoleFilter: args.agent_role ?? null,
+            resultCount: rows.length,
+          });
+
           return ok({
             memories: rows.map(formatMemory),
             total: rows.length,
@@ -387,6 +414,12 @@ async function main() {
 
         case "mark_used": {
           const found = await backend.markUsed(args.memory_id);
+
+          emitEvent("memory_used", {
+            memoryId: args.memory_id,
+            found,
+          });
+
           return ok({ found, memory_id: args.memory_id });
         }
 
@@ -396,6 +429,13 @@ async function main() {
             older_than_days: args.older_than_days ?? 30,
             agent_role: AGENT_ROLE,
             written_by_agent: WRITTEN_BY_AGENT,
+          });
+
+          emitEvent("memory_compacted", {
+            repo: args.repo,
+            olderThanDays: args.older_than_days ?? 30,
+            deleted: result.deleted,
+            summariesCreated: result.summaries_created,
           });
 
           return ok({
