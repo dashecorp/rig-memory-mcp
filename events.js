@@ -1,16 +1,25 @@
 /**
  * Event emission to Conductor-E.
  *
- * Every successful memory tool call mirrors to Conductor-E's /api/events
- * endpoint so the rig's central event store / dashboards see memory activity
- * alongside cli_started, token_usage, heartbeat, etc.
+ * Mirrors successful memory MCP tool calls as events in Conductor-E's event
+ * store (Marten). Payload shape matches `SubmitEventRequest` in
+ * dashecorp/conductor-e `src/ConductorE.Core/UseCases/SubmitEvent.cs`:
+ * PascalCase fields, UPPER_SNAKE event types.
  *
- * Fire-and-forget: emission failures never break the MCP call. Silent skip
- * when CONDUCTOR_BASE_URL is unset (local dev / standalone use).
+ * Emitted types (all known to SubmitEvent's MapToEvent switch):
+ *   - MEMORY_WRITE     on write_memory
+ *   - MEMORY_READ      on read_memories
+ *   - MEMORY_HIT_USED  on mark_used
+ *
+ * `list_recent` and `compact_repo` have no matching Conductor record type
+ * (yet) — skipped silently. Add them on the Conductor side if we want them.
+ *
+ * Fire-and-forget: emission failures log but never break the MCP call.
+ * Silent skip when CONDUCTOR_BASE_URL is unset (local dev / standalone).
  *
  * FUTURE: replace with OTel GenAI span emission once the rig has an OTel
- * collector deployed (whitepaper observability.md). Until then, the JSON
- * POST keeps the same payload shape so the migration is lossless.
+ * collector deployed (whitepaper observability.md). Payload shape is close
+ * to OTel attributes so the migration is near-lossless.
  */
 
 const CONDUCTOR_BASE_URL = process.env.CONDUCTOR_BASE_URL || "";
@@ -20,23 +29,8 @@ const AGENT_ID = process.env.AGENT_ID || WRITTEN_BY_AGENT;
 
 const EMIT_TIMEOUT_MS = 2000;
 
-/**
- * Emit a memory event to Conductor-E. Non-blocking; errors are logged but swallowed.
- *
- * @param {string} type - event type, e.g. "memory_written", "memory_read"
- * @param {object} payload - event-specific fields (merged with agent identity)
- */
-export function emitEvent(type, payload = {}) {
+function post(body) {
   if (!CONDUCTOR_BASE_URL) return;
-
-  const body = {
-    type,
-    agentId: AGENT_ID,
-    agentRole: AGENT_ROLE,
-    writtenByAgent: WRITTEN_BY_AGENT,
-    timestamp: new Date().toISOString(),
-    ...payload,
-  };
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), EMIT_TIMEOUT_MS);
@@ -49,12 +43,57 @@ export function emitEvent(type, payload = {}) {
   })
     .then((r) => {
       if (!r.ok) {
-        console.error(`[rig-memory] event emit ${type} → ${r.status}`);
+        console.error(`[rig-memory] event emit ${body.Type} → ${r.status}`);
       }
     })
     .catch((e) => {
-      // Swallow — never let telemetry break the tool call.
-      console.error(`[rig-memory] event emit ${type} failed: ${e.message}`);
+      console.error(`[rig-memory] event emit ${body.Type} failed: ${e.message}`);
     })
     .finally(() => clearTimeout(timer));
+}
+
+/**
+ * Emitted after a successful write_memory. Conductor record: MemoryWrite.
+ * Required: Repo, IssueNumber, AgentId, Scope, Kind, MemoryId, Tokens.
+ */
+export function emitMemoryWrite({ repo, issueId, scope, kind, memoryId, tokens = 0 }) {
+  post({
+    Type: "MEMORY_WRITE",
+    Repo: repo || "",
+    IssueNumber: issueId ?? 0,
+    AgentId: AGENT_ID,
+    Scope: scope || "",
+    Kind: kind || "",
+    MemoryId: memoryId || "",
+    Tokens: tokens,
+  });
+}
+
+/**
+ * Emitted after a successful read_memories. Conductor record: MemoryRead.
+ * Required: Repo, IssueNumber, AgentId, Query, Hits, TokensLoaded.
+ */
+export function emitMemoryRead({ repo, issueId, query, hits, tokensLoaded = 0 }) {
+  post({
+    Type: "MEMORY_READ",
+    Repo: repo || "",
+    IssueNumber: issueId ?? 0,
+    AgentId: AGENT_ID,
+    Query: query || "",
+    Hits: hits ?? 0,
+    TokensLoaded: tokensLoaded,
+  });
+}
+
+/**
+ * Emitted after a successful mark_used. Conductor record: MemoryHitUsed.
+ * Required: MemoryId, AgentId, UsedInOutput.
+ */
+export function emitMemoryHitUsed({ memoryId, usedInOutput = true }) {
+  post({
+    Type: "MEMORY_HIT_USED",
+    MemoryId: memoryId || "",
+    AgentId: AGENT_ID,
+    UsedInOutput: usedInOutput,
+  });
 }
