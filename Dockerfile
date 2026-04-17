@@ -6,6 +6,9 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 
+# Build tools required by better-sqlite3 native addon
+RUN apk add --no-cache python3 make g++
+
 # Install production deps only
 COPY package*.json ./
 RUN npm ci --omit=dev --omit=optional

@@ -1,27 +1,40 @@
 ---
 title: rig-memory-mcp API Reference
-description: MCP tool API for the Postgres+pgvector backed agent memory server
+description: MCP tool API for the agent memory server — Postgres+pgvector primary, SQLite fallback
 type: reference
 queries:
   - rig memory mcp tools
   - write_memory read_memories list_recent mark_used compact_repo
-  - agent memory postgres pgvector
-updated: 2026-04-16
+  - agent memory postgres pgvector sqlite fallback
+updated: 2026-04-17
 ---
 
 # rig-memory-mcp API Reference
 
-Postgres + pgvector backed MCP memory server. Provides 5 tools for writing, searching, and managing agent memories.
+MCP memory server for the engineering rig. Provides 5 tools for writing, searching, and managing agent memories. Uses Postgres+pgvector when `DB_URL` is set; falls back to SQLite+FTS5 otherwise.
+
+## Backend selection
+
+| Condition | Backend used |
+|---|---|
+| `DB_URL` set, Postgres reachable | Postgres + pgvector (hybrid text+vector search) |
+| `DB_URL` set, Postgres fails, `MEMORY_STRICT` unset | SQLite at `SQLITE_PATH` (text-only search) |
+| `DB_URL` set, Postgres fails, `MEMORY_STRICT=true` | Process exits with error |
+| `DB_URL` not set | SQLite at `SQLITE_PATH` (text-only search) |
+
+SQLite default path: `$HOME/.rig-memory/memory.db` (directory created automatically).
 
 ## Configuration
 
 | Env var | Required | Description |
 |---|---|---|
-| `DB_URL` | ✅ | Postgres connection string |
 | `AGENT_ROLE` | ✅ | Calling agent's role identifier |
+| `DB_URL` | — | Postgres connection string. If unset, SQLite is used. |
 | `WRITTEN_BY_AGENT` | — | Agent name stamped on writes (defaults to `AGENT_ROLE`) |
 | `REPO` | — | Default repo slug for writes |
-| `OPENAI_API_KEY` | — | Enables vector embeddings |
+| `SQLITE_PATH` | — | Override SQLite DB path (default: `$HOME/.rig-memory/memory.db`) |
+| `MEMORY_STRICT` | — | Set `true` to exit instead of falling back to SQLite on Postgres failure |
+| `OPENAI_API_KEY` | — | Enables vector embeddings (Postgres backend only) |
 | `OPENAI_BASE_URL` | — | Override OpenAI base URL |
 
 ## Tools

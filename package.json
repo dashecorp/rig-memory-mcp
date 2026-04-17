@@ -8,7 +8,7 @@
     "url": "https://github.com/dashecorp/rig-memory-mcp.git"
   },
   "version": "2.0.0",
-  "description": "MCP memory server for the engineering rig — Postgres + pgvector backed persistent agent memory",
+  "description": "MCP memory server for the engineering rig — Postgres+pgvector primary, SQLite fallback",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -27,6 +27,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
+    "better-sqlite3": "^12.9.0",
     "pg": "^8.13.0"
   },
   "optionalDependencies": {
