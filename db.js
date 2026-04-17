@@ -1,17 +1,25 @@
 /**
  * Database layer for rig-memory-mcp.
  *
- * Backend: Postgres + pgvector + tsvector hybrid search.
+ * Backends:
+ *   1. Postgres + pgvector + tsvector hybrid search (primary)
+ *   2. SQLite + FTS5 text search (fallback / no-DB_URL mode)
  *
- * Required env var:
+ * Required env var (for Postgres):
  *   DB_URL  — Postgres connection string (e.g. postgres://user:pass@host/db)
  *
  * Optional env vars:
  *   OPENAI_API_KEY   — enables embedding generation (text-embedding-3-small)
  *   OPENAI_BASE_URL  — override OpenAI API base (for compatible endpoints)
+ *   SQLITE_PATH      — override SQLite DB file path (default: $HOME/.rig-memory/memory.db)
+ *   MEMORY_STRICT    — set "true" to exit instead of falling back to SQLite on Postgres failure
  */
 
 import pg from "pg";
+import { createRequire } from "module";
+import { mkdirSync } from "fs";
+import { dirname, resolve } from "path";
+import { randomUUID } from "crypto";
 
 const { Pool } = pg;
 
@@ -315,4 +323,227 @@ export async function compactRepo(pool, opts) {
   deleted += expiredDeleted;
 
   return { deleted, summaries_created };
+}
+
+// ---------- SQLite Backend ----------
+
+const SQLITE_DDL = [
+  `CREATE TABLE IF NOT EXISTS rig_memory (
+    id              TEXT    PRIMARY KEY,
+    agent_role      TEXT    NOT NULL,
+    written_by_agent TEXT   NOT NULL,
+    repo            TEXT    NOT NULL,
+    issue_id        INTEGER,
+    scope           TEXT    NOT NULL,
+    kind            TEXT    NOT NULL,
+    title           TEXT    NOT NULL,
+    content         TEXT    NOT NULL,
+    tags            TEXT    NOT NULL DEFAULT '[]',
+    importance      INTEGER NOT NULL DEFAULT 3,
+    created_at      TEXT    NOT NULL,
+    expires_at      TEXT,
+    hit_count       INTEGER NOT NULL DEFAULT 0,
+    last_used_at    TEXT
+  )`,
+  `CREATE VIRTUAL TABLE IF NOT EXISTS rig_memory_fts USING fts5(
+    id   UNINDEXED,
+    title,
+    content
+  )`,
+];
+
+/**
+ * SQLite backend implementing the same async interface as the Postgres helpers.
+ * Uses better-sqlite3 (synchronous) wrapped in Promise for interface uniformity.
+ */
+export class SqliteBackend {
+  /** @param {import('better-sqlite3').Database} db */
+  constructor(db) {
+    this._db = db;
+    this._db.pragma("journal_mode = WAL");
+    for (const stmt of SQLITE_DDL) {
+      this._db.exec(stmt);
+    }
+  }
+
+  /** @param {object} m @returns {Promise<string>} UUID */
+  async insertMemory(m) {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    this._db.prepare(`
+      INSERT INTO rig_memory
+        (id, agent_role, written_by_agent, repo, issue_id, scope, kind, title, content, tags, importance, created_at, expires_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      id, m.agent_role, m.written_by_agent, m.repo,
+      m.issue_id ?? null, m.scope, m.kind, m.title, m.content,
+      JSON.stringify(m.tags ?? []), m.importance ?? 3, now, m.expires_at ?? null,
+    );
+    this._db.prepare(
+      `INSERT INTO rig_memory_fts(id, title, content) VALUES (?,?,?)`
+    ).run(id, m.title, m.content);
+    return id;
+  }
+
+  /** @param {object} opts @returns {Promise<Array>} */
+  async searchMemories(opts) {
+    const { query, agent_role, repo, issue_id, limit = 20 } = opts;
+    const now = new Date().toISOString();
+    let rows;
+    try {
+      rows = this._db.prepare(`
+        SELECT m.id, m.agent_role, m.written_by_agent, m.repo, m.issue_id,
+               m.scope, m.kind, m.title, m.content, m.tags, m.importance,
+               m.created_at, m.expires_at, m.hit_count, m.last_used_at,
+               s.rank AS _rank
+        FROM rig_memory m
+        JOIN (SELECT id, rank FROM rig_memory_fts WHERE rig_memory_fts MATCH ?) s ON m.id = s.id
+        WHERE (m.expires_at IS NULL OR m.expires_at > ?)
+          AND (? IS NULL OR m.agent_role = ?)
+          AND (? IS NULL OR m.repo = ?)
+          AND (? IS NULL OR m.issue_id = ?)
+        ORDER BY s.rank
+        LIMIT ?
+      `).all(
+        query, now,
+        agent_role ?? null, agent_role ?? null,
+        repo ?? null, repo ?? null,
+        issue_id ?? null, issue_id ?? null,
+        limit,
+      );
+    } catch {
+      // FTS5 query parse error (special chars) — fall back to LIKE search
+      const like = `%${query}%`;
+      rows = this._db.prepare(`
+        SELECT *, NULL AS _rank
+        FROM rig_memory
+        WHERE (title LIKE ? OR content LIKE ?)
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND (? IS NULL OR agent_role = ?)
+          AND (? IS NULL OR repo = ?)
+          AND (? IS NULL OR issue_id = ?)
+        ORDER BY importance DESC, created_at DESC
+        LIMIT ?
+      `).all(
+        like, like, now,
+        agent_role ?? null, agent_role ?? null,
+        repo ?? null, repo ?? null,
+        issue_id ?? null, issue_id ?? null,
+        limit,
+      );
+    }
+    return rows.map(({ _rank, ...r }) => ({
+      ...r,
+      tags: typeof r.tags === "string" ? JSON.parse(r.tags) : (r.tags ?? []),
+      // FTS5 rank is negative (more negative = better). Negate for intuitive positive score.
+      text_score: _rank != null ? -_rank : 1.0,
+      vec_score: 0,
+      hybrid_score: _rank != null ? -_rank : 1.0,
+    }));
+  }
+
+  /** @param {object} opts @returns {Promise<Array>} */
+  async listRecent(opts) {
+    const { agent_role, repo, limit = 10 } = opts;
+    const now = new Date().toISOString();
+    const rows = this._db.prepare(`
+      SELECT * FROM rig_memory
+      WHERE (expires_at IS NULL OR expires_at > ?)
+        AND (? IS NULL OR agent_role = ?)
+        AND (? IS NULL OR repo = ?)
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(now, agent_role ?? null, agent_role ?? null, repo ?? null, repo ?? null, limit);
+    return rows.map(r => ({
+      ...r,
+      tags: typeof r.tags === "string" ? JSON.parse(r.tags) : (r.tags ?? []),
+    }));
+  }
+
+  /** @param {string} id @returns {Promise<boolean>} */
+  async markUsed(id) {
+    const now = new Date().toISOString();
+    const { changes } = this._db.prepare(`
+      UPDATE rig_memory SET hit_count = hit_count + 1, last_used_at = ? WHERE id = ?
+    `).run(now, id);
+    return changes > 0;
+  }
+
+  /** @param {object} opts @returns {Promise<{deleted:number, summaries_created:number}>} */
+  async compactRepo(opts) {
+    const { repo, older_than_days = 30, agent_role, written_by_agent } = opts;
+    const cutoff = new Date(Date.now() - older_than_days * 86_400_000).toISOString();
+
+    const groups = this._db.prepare(`
+      SELECT scope, kind FROM rig_memory
+      WHERE repo = ? AND created_at < ?
+      GROUP BY scope, kind HAVING COUNT(*) > 1
+    `).all(repo, cutoff);
+
+    let deleted = 0;
+    let summaries_created = 0;
+
+    for (const { scope, kind } of groups) {
+      const old = this._db.prepare(`
+        SELECT id, title, content, tags, importance FROM rig_memory
+        WHERE repo = ? AND created_at < ? AND scope = ? AND kind = ?
+        ORDER BY importance DESC, created_at ASC
+      `).all(repo, cutoff, scope, kind);
+
+      if (old.length < 2) continue;
+
+      const summaryTitle = `[compacted] ${scope}/${kind} — ${old.length} entries`;
+      const summaryContent =
+        `Compacted ${old.length} memories (repo: ${repo}, scope: ${scope}, kind: ${kind}).\n\n` +
+        old.map((r, i) => `${i + 1}. **${r.title}**\n${r.content}`).join("\n\n---\n\n");
+      const allTags = [...new Set(old.flatMap(r => JSON.parse(r.tags || "[]")))];
+      const maxImportance = Math.max(...old.map(r => r.importance));
+
+      await this.insertMemory({
+        agent_role, written_by_agent, repo,
+        issue_id: null, scope, kind,
+        title: summaryTitle, content: summaryContent,
+        tags: allTags, importance: maxImportance, expires_at: null,
+      });
+      summaries_created++;
+
+      for (const oid of old.map(r => r.id)) {
+        this._db.prepare(`DELETE FROM rig_memory WHERE id = ?`).run(oid);
+        this._db.prepare(`DELETE FROM rig_memory_fts WHERE id = ?`).run(oid);
+      }
+      deleted += old.length;
+    }
+
+    // Prune expired
+    const now = new Date().toISOString();
+    const { changes } = this._db.prepare(`
+      DELETE FROM rig_memory WHERE repo = ? AND expires_at IS NOT NULL AND expires_at < ?
+    `).run(repo, now);
+    deleted += changes;
+
+    return { deleted, summaries_created };
+  }
+
+  async close() {
+    this._db.close();
+  }
+}
+
+/**
+ * Open (or create) a SQLite database at the given path.
+ * Creates the parent directory if it does not exist.
+ *
+ * @param {string} dbPath  Absolute or relative path to the .db file.
+ * @returns {SqliteBackend}
+ * @throws if better-sqlite3 is not installed or the path cannot be created/opened.
+ */
+export function createSqliteBackend(dbPath) {
+  const abs = resolve(dbPath);
+  mkdirSync(dirname(abs), { recursive: true });
+
+  // better-sqlite3 is CJS — use createRequire for ESM interop
+  const _require = createRequire(import.meta.url);
+  const Database = _require("better-sqlite3");
+  const db = new Database(abs);
+  return new SqliteBackend(db);
 }

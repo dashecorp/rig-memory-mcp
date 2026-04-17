@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 
 /**
- * rig-memory-mcp — Postgres + pgvector backed MCP memory server.
+ * rig-memory-mcp — MCP memory server with Postgres (primary) and SQLite (fallback) backends.
  *
  * Required env vars:
- *   DB_URL          Postgres connection string
- *   AGENT_ROLE      Role of the running agent (e.g. "dev-e")
+ *   AGENT_ROLE        Role of the running agent (e.g. "dev-e")
  *
  * Optional env vars:
+ *   DB_URL            Postgres connection string. If unset, SQLite is used directly.
  *   WRITTEN_BY_AGENT  Defaults to AGENT_ROLE
  *   REPO              Default repo slug for writes (e.g. "dashecorp/my-repo")
  *   OPENAI_API_KEY    Enables vector embeddings (text-embedding-3-small)
  *   OPENAI_BASE_URL   Override OpenAI base URL (for compatible endpoints)
+ *   SQLITE_PATH       SQLite DB file path (default: $HOME/.rig-memory/memory.db)
+ *   MEMORY_STRICT     Set "true" to exit instead of falling back to SQLite on Postgres failure
  */
 
+import { join } from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -29,6 +32,7 @@ import {
   listRecent,
   markUsed,
   compactRepo,
+  createSqliteBackend,
 } from "./db.js";
 
 // ---------- Config ----------
@@ -40,6 +44,67 @@ const DEFAULT_REPO = process.env.REPO || "";
 if (!AGENT_ROLE) {
   console.error("[rig-memory] FATAL: AGENT_ROLE env var is required");
   process.exit(1);
+}
+
+// ---------- Backend adapter ----------
+
+/**
+ * Wraps a pg Pool with the same async interface as SqliteBackend.
+ */
+class PostgresBackend {
+  constructor(pool) {
+    this._pool = pool;
+  }
+  insertMemory(m) { return insertMemory(this._pool, m); }
+  searchMemories(opts) { return searchMemories(this._pool, opts); }
+  listRecent(opts) { return listRecent(this._pool, opts); }
+  markUsed(id) { return markUsed(this._pool, id); }
+  compactRepo(opts) { return compactRepo(this._pool, opts); }
+  async close() { return this._pool.end(); }
+}
+
+/**
+ * Determine which backend to use based on env vars.
+ * Priority: Postgres (DB_URL) → SQLite fallback / no-DB_URL.
+ *
+ * @returns {Promise<PostgresBackend|import('./db.js').SqliteBackend>}
+ */
+async function createBackend() {
+  const dbUrl = process.env.DB_URL;
+  const strict = process.env.MEMORY_STRICT === "true";
+
+  if (dbUrl) {
+    console.error("[rig-memory] DB_URL set — connecting to Postgres");
+    try {
+      const pool = await createPool();
+      await initSchema(pool);
+      console.error("[rig-memory] Postgres connected, schema ready");
+      return new PostgresBackend(pool);
+    } catch (pgErr) {
+      console.error("[rig-memory] Postgres connection failed:", pgErr.message);
+      if (strict) {
+        console.error("[rig-memory] MEMORY_STRICT=true — exiting");
+        process.exit(1);
+      }
+      console.error("[rig-memory] Falling back to SQLite");
+    }
+  } else {
+    console.error("[rig-memory] No DB_URL — using SQLite backend");
+  }
+
+  // SQLite path: env override, or $HOME/.rig-memory/memory.db
+  const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
+  const defaultPath = join(home, ".rig-memory", "memory.db");
+  const dbPath = process.env.SQLITE_PATH || defaultPath;
+
+  try {
+    const backend = createSqliteBackend(dbPath);
+    console.error(`[rig-memory] SQLite backend ready at ${dbPath}`);
+    return backend;
+  } catch (sqliteErr) {
+    console.error("[rig-memory] SQLite backend failed:", sqliteErr.message);
+    process.exit(1);
+  }
 }
 
 // ---------- Embeddings (optional) ----------
@@ -86,7 +151,7 @@ const TOOLS = [
   {
     name: "write_memory",
     description:
-      "Persist a memory to the shared Postgres store. " +
+      "Persist a memory to the shared store. " +
       "Agent identity (role, repo) is taken from server env vars.",
     inputSchema: {
       type: "object",
@@ -237,12 +302,10 @@ const TOOLS = [
 // ---------- Server ----------
 
 async function main() {
-  // DB
-  const pool = await createPool();
-  await initSchema(pool);
-  console.error("[rig-memory] Postgres connected, schema ready");
+  // Backend selection: Postgres → SQLite fallback, or SQLite direct
+  const backend = await createBackend();
 
-  // Embeddings (best-effort)
+  // Embeddings (best-effort, Postgres only benefits from vector embedding)
   await initEmbeddings();
 
   // MCP server
@@ -268,7 +331,7 @@ async function main() {
 
           const embedding = await embed(`${args.title}\n\n${args.content}`);
 
-          const id = await insertMemory(pool, {
+          const id = await backend.insertMemory({
             agent_role: AGENT_ROLE,
             written_by_agent: WRITTEN_BY_AGENT,
             repo,
@@ -293,7 +356,7 @@ async function main() {
         case "read_memories": {
           const embedding = await embed(args.query);
 
-          const rows = await searchMemories(pool, {
+          const rows = await backend.searchMemories({
             query: args.query,
             agent_role: args.agent_role ?? null,
             repo: args.repo ?? null,
@@ -310,7 +373,7 @@ async function main() {
         }
 
         case "list_recent": {
-          const rows = await listRecent(pool, {
+          const rows = await backend.listRecent({
             agent_role: args.agent_role ?? null,
             repo: args.repo ?? null,
             limit: args.limit ?? 10,
@@ -323,12 +386,12 @@ async function main() {
         }
 
         case "mark_used": {
-          const found = await markUsed(pool, args.memory_id);
+          const found = await backend.markUsed(args.memory_id);
           return ok({ found, memory_id: args.memory_id });
         }
 
         case "compact_repo": {
-          const result = await compactRepo(pool, {
+          const result = await backend.compactRepo({
             repo: args.repo,
             older_than_days: args.older_than_days ?? 30,
             agent_role: AGENT_ROLE,
