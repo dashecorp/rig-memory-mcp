@@ -1,9 +1,9 @@
 /**
- * Event emission to Conductor-E.
+ * Event emission to rig-conductor.
  *
- * Mirrors successful memory MCP tool calls as events in Conductor-E's event
+ * Mirrors successful memory MCP tool calls as events in rig-conductor's event
  * store (Marten). Payload shape matches `SubmitEventRequest` in
- * dashecorp/conductor-e `src/ConductorE.Core/UseCases/SubmitEvent.cs`:
+ * dashecorp/rig-conductor `src/ConductorE.Core/UseCases/SubmitEvent.cs`:
  * PascalCase fields, UPPER_SNAKE event types.
  *
  * Emitted types (all known to SubmitEvent's MapToEvent switch):
