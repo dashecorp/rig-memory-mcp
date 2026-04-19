@@ -183,3 +183,5 @@ Images are published to GHCR on every push to `main`:
 ghcr.io/dashecorp/rig-memory-mcp:latest
 ghcr.io/dashecorp/rig-memory-mcp:sha-<commit>
 ```
+
+> Rig orchestrator renamed conductor-e → rig-conductor on 2026-04-19 (dashecorp/infra#76).
