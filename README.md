@@ -185,3 +185,5 @@ ghcr.io/dashecorp/rig-memory-mcp:sha-<commit>
 ```
 
 > Rig orchestrator renamed conductor-e → rig-conductor on 2026-04-19 (dashecorp/infra#76).
+
+> E2E smoke #2 passed on 2026-04-19 after rig-gitops#105 fixed the stale DB_URL hostname.
