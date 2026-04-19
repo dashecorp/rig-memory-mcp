@@ -6,7 +6,7 @@ queries:
   - rig memory mcp tools
   - write_memory read_memories list_recent mark_used compact_repo
   - agent memory postgres pgvector sqlite fallback
-updated: 2026-04-17
+updated: 2026-04-19
 ---
 
 # rig-memory-mcp API Reference
