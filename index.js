@@ -397,7 +397,7 @@ async function main() {
             limit: args.limit ?? 10,
           });
 
-          // Conductor-E has no matching event type for list_recent today.
+          // rig-conductor has no matching event type for list_recent today.
           // Add a MEMORY_LISTED record there if we want dashboard visibility.
 
           return ok({
@@ -427,7 +427,7 @@ async function main() {
             written_by_agent: WRITTEN_BY_AGENT,
           });
 
-          // Conductor-E has no MEMORY_COMPACTED record type today — add one there
+          // rig-conductor has no MEMORY_COMPACTED record type today — add one there
           // if compaction activity becomes observability-relevant.
 
           return ok({

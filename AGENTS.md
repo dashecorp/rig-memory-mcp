@@ -18,7 +18,7 @@ MCP server exposing persistent agent memory backed by Postgres + pgvector. Tools
 ## Conventions
 
 - Embedding model: OpenAI `text-embedding-3-small` (configurable via env).
-- Scope enum: `repo`, `rig`, `session` — keep in sync with Conductor-E event schema.
+- Scope enum: `repo`, `rig`, `session` — keep in sync with rig-conductor event schema.
 - Kind enum: `learning`, `decision`, `error`, `pattern`, `standard`.
 - Importance: 1–5. Hit-count auto-tracked via `mark_used`.
 - Memory promotion candidate: importance ≥ 4 AND hit_count ≥ 5 (see docs-memory-drift-lint research).
@@ -29,4 +29,4 @@ MCP server exposing persistent agent memory backed by Postgres + pgvector. Tools
 - SQLite default path: `$HOME/.rig-memory/memory.db`. Parent directory is created on startup if it doesn't exist.
 - Set `MEMORY_STRICT=true` to make the server exit (rather than fall back) when Postgres auth fails.
 - Embedding calls are fire-and-forget; timeout 2s. Failures logged but not propagated.
-- Event emission to Conductor-E mirrors MEMORY_WRITE / MEMORY_READ / MEMORY_HIT_USED — payload shape in `events.js`.
+- Event emission to rig-conductor mirrors MEMORY_WRITE / MEMORY_READ / MEMORY_HIT_USED — payload shape in `events.js`.
