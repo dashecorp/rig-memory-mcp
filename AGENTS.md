@@ -5,8 +5,11 @@
 ## Build & Test
 
 - Install: `npm install`
-- Test: `npm test`
+- Test (SQLite only — no DB needed): `AGENT_ROLE=test node test.js`
+- Test (full — SQLite + Postgres): `DB_URL=postgres://... AGENT_ROLE=test node test.js`
 - Migrate dev schema: `node migrate.js`
+
+The SQLite suite always runs. The Postgres suite is skipped when `DB_URL` is unset.
 
 ## Purpose
 
@@ -22,6 +25,8 @@ MCP server exposing persistent agent memory backed by Postgres + pgvector. Tools
 
 ## Gotchas
 
-- Postgres + pgvector extension required. Local dev uses SQLite fallback (migration path in `db.js`).
+- Postgres + pgvector extension required for primary backend. Local dev and pods without `DB_URL` use SQLite fallback automatically.
+- SQLite default path: `$HOME/.rig-memory/memory.db`. Parent directory is created on startup if it doesn't exist.
+- Set `MEMORY_STRICT=true` to make the server exit (rather than fall back) when Postgres auth fails.
 - Embedding calls are fire-and-forget; timeout 2s. Failures logged but not propagated.
 - Event emission to Conductor-E mirrors MEMORY_WRITE / MEMORY_READ / MEMORY_HIT_USED — payload shape in `events.js`.
