@@ -28,8 +28,28 @@ DB_URL=postgres://... AGENT_ROLE=dev-e node index.js
 | `REPO` | — | `""` | Default repo slug for `write_memory` |
 | `OPENAI_API_KEY` | — | — | Enables semantic embeddings (text-embedding-3-small) |
 | `OPENAI_BASE_URL` | — | OpenAI default | Override base URL for OpenAI-compatible endpoints |
+| `TENANT_ID` | — | — | **Multi-tenant mode (rc#1478).** When set, binds this process to one tenant; see below |
+| `MEMORY_STRICT` | — | `false` | Single-tenant mode only: exit instead of SQLite-fallback on Postgres failure |
 
 Without `OPENAI_API_KEY`, the server runs in **text-only mode** (BM25/tsvector search only).
+
+## Multi-tenancy — hard memory isolation (rc#1478)
+
+The rig is multi-tenant: each tenant's agent memory is **physically isolated in its own Postgres+pgvector database** (`rig_t_<id>_mem`), not a shared table with a `tenant_id` filter. *The LLM is the threat model, not the guard* — a forgotten or prompt-injected retrieval predicate on a shared table is a leak; a wrong database connection simply cannot return another tenant's rows.
+
+This MCP server is **one process per agent** (stdio), so the tenant boundary is the **process**, bound once at startup from the server-trusted `TENANT_ID` env var (set by the conductor when it materializes the agent's pod/session) — **never** from an MCP tool argument.
+
+**Multi-tenant mode** (`TENANT_ID` set):
+
+- The tenant slug is validated against the frozen naming convention (`^[a-z][a-z0-9]{1,19}$` + reserved blocklist, ported from rig-conductor's `TenantId`). An invalid `TENANT_ID` is fatal — fail closed, never default.
+- A per-tenant Postgres `DB_URL` pointing at `rig_t_<id>_mem` is **required**. There is **no SQLite fallback** (a single file could silently merge two tenants), and the live connection is asserted to equal `rig_t_<id>_mem` — a misconfigured DSN that lands on the wrong (or a shared) database is refused at startup.
+- Provisioning a tenant's `rig_t_<id>_mem` database is a deliberate operator/onboarding step; the server never `CREATE DATABASE`s. An unknown tenant's DB does not exist → the server refuses to start.
+- **Isolation is the connection, full stop:** there is no `tenant_id` column and no retrieval-time tenant filter on `rig_memory`. Tool arguments that try to assert a tenant or a raw DSN (`tenant`, `tenant_id`, `db`, `db_url`, …) are hard-rejected.
+- **Right to erasure:** dropping `rig_t_<id>_mem` is complete, orphan-free erasure of that tenant's memory plane.
+
+**Single-tenant / legacy mode** (`TENANT_ID` unset): unchanged — Postgres (`DB_URL`) with SQLite fallback. Tenant-0 (`invotek`) runs here until its memory plane is cut over to `rig_t_invotek_mem`.
+
+> **Conductor wiring (Part B of rc#1478)** — injecting the per-tenant `DB_URL`/secret-ref into the agent session via the P0 `ITenantResolver` / `Tenant` registry — lands when per-tenant agent pods exist (gated on the namespace-per-tenant item #1482). This server is ready for it now.
 
 ## Database schema
 

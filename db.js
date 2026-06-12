@@ -83,6 +83,30 @@ export async function createPool() {
   return pool;
 }
 
+/**
+ * Defense-in-depth tenant-DB assertion (rc#1478). Confirms the live connection actually
+ * lands on the expected per-tenant database (`rig_t_<id>_mem`). This catches a misconfigured
+ * DSN injection that would otherwise silently write/read a tenant's memory against the wrong
+ * (or a shared) database — the connection IS the isolation boundary, so a wrong connection is
+ * the whole failure mode. Throws on mismatch so the server fails closed at startup.
+ *
+ * @param {import('pg').Pool} pool
+ * @param {string} expectedDb the derived `rig_t_<id>_mem` name
+ * @returns {Promise<string>} the actual current database (on match)
+ */
+export async function assertCurrentDatabase(pool, expectedDb) {
+  const { rows } = await pool.query("SELECT current_database() AS db");
+  const actual = rows[0]?.db;
+  if (actual !== expectedDb) {
+    throw new Error(
+      `tenant DB mismatch: connected to '${actual}', expected '${expectedDb}'. ` +
+        `The injected DB_URL must point at this tenant's own database — refusing to start ` +
+        `(a wrong connection would cross the tenant isolation boundary).`
+    );
+  }
+  return actual;
+}
+
 /** Initialize schema — idempotent. */
 export async function initSchema(pool) {
   // Run statements split by semicolon

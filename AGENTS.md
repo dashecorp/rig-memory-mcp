@@ -27,6 +27,7 @@ MCP server exposing persistent agent memory backed by Postgres + pgvector. Tools
 
 - Postgres + pgvector extension required for primary backend. Local dev and pods without `DB_URL` use SQLite fallback automatically.
 - SQLite default path: `$HOME/.rig-memory/memory.db`. Parent directory is created on startup if it doesn't exist.
-- Set `MEMORY_STRICT=true` to make the server exit (rather than fall back) when Postgres auth fails.
+- Set `MEMORY_STRICT=true` to make the server exit (rather than fall back) when Postgres auth fails (single-tenant mode only).
+- **Multi-tenant mode (rc#1478):** set `TENANT_ID=<slug>` and the process binds to one tenant — requires a `DB_URL` pointing at `rig_t_<id>_mem` (asserted at startup), disables the SQLite fallback, and hard-rejects any tool arg that asserts a tenant/DSN. `tenant.js` ports the slug rules from rig-conductor's `TenantId` — keep them in sync. Isolation is the connection: never add a `tenant_id` column or a retrieval filter.
 - Embedding calls are fire-and-forget; timeout 2s. Failures logged but not propagated.
 - Event emission to rig-conductor mirrors MEMORY_WRITE / MEMORY_READ / MEMORY_HIT_USED — payload shape in `events.js`.

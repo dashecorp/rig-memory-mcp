@@ -7,13 +7,15 @@ MCP server providing persistent, searchable agent memory backed by Postgres + pg
 ```
 rig-memory-mcp/
 ├── index.js       # MCP server — tool definitions and handlers
-├── db.js          # Postgres layer — schema, queries
-├── test.js        # Integration tests (requires Postgres+pgvector)
+├── db.js          # Postgres layer — schema, queries, tenant-DB assertion
+├── tenant.js      # Multi-tenancy (rc#1478) — slug validation + per-tenant DB binding
+├── test.js        # Integration tests (tenant + SQLite always; Postgres + isolation with DB_URL)
 ├── Dockerfile     # Production image (node:22-alpine)
 ├── package.json
 ├── README.md
 └── docs/
-    └── api.md     # Full tool API reference
+    ├── api.md                              # Full tool API reference
+    └── 2026-06-12-multi-tenancy-db-per-tenant.md  # rc#1478 design + isolation model
 ```
 
 ## Tech stack
@@ -31,6 +33,7 @@ rig-memory-mcp/
 
 | Decision | Rationale |
 |---|---|
+| DB-per-tenant, never a tenant column (rc#1478) | Hard memory isolation: a wrong DB connection can't leak; a forgotten/injected filter on a shared table can. No `tenant_id` column, no retrieval filter |
 | Single `rig_memory` table | Unified schema across all memory types; scope/kind fields differentiate |
 | Generated tsvector column | No manual sync needed; always consistent with content |
 | HNSW index (not IVFFlat) | No training data required; better cold-start performance |
@@ -48,6 +51,7 @@ rig-memory-mcp/
 | `REPO` | — | Default repo for writes |
 | `OPENAI_API_KEY` | — | Enables embedding generation |
 | `OPENAI_BASE_URL` | — | Override OpenAI base URL |
+| `TENANT_ID` | — | **Multi-tenant mode (rc#1478).** Binds the process to one tenant → requires a `rig_t_<id>_mem` DB, no SQLite fallback. See `tenant.js` + README §Multi-tenancy |
 
 ## Running tests
 

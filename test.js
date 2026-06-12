@@ -12,6 +12,7 @@
 import {
   createPool,
   initSchema,
+  assertCurrentDatabase,
   insertMemory,
   searchMemories,
   listRecent,
@@ -19,6 +20,14 @@ import {
   compactRepo,
   createSqliteBackend,
 } from "./db.js";
+import {
+  tryNormalizeTenantSlug,
+  isValidTenantSlug,
+  normalizeTenantSlug,
+  memoryDbName,
+  resolveTenantBinding,
+  findForbiddenTenantArg,
+} from "./tenant.js";
 import { existsSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -39,6 +48,78 @@ function assert(condition, msg) {
 
 async function cleanupPg(pool) {
   await pool.query("DELETE FROM rig_memory WHERE agent_role = 'test-agent'");
+}
+
+// ---------- Tenant-binding tests (rc#1478, pure — no DB) ----------
+
+function runTenantTests() {
+  console.log("\n=== Tenant: slug validation (ported from TenantId) ===");
+
+  // Valid slugs
+  for (const ok of ["invotek", "acme", "ab", "a1", "tenant1x", "abcdefghij0123456789"]) {
+    assert(isValidTenantSlug(ok), `valid slug accepted: '${ok}'`);
+    assert(tryNormalizeTenantSlug(ok) === ok, `valid slug normalizes to itself: '${ok}'`);
+  }
+  // Trim + lowercase normalization
+  assert(tryNormalizeTenantSlug("  Acme  ") === "acme", "trims + lowercases ' Acme '");
+
+  // Invalid: format. NB 'Inv' is intentionally NOT here — it lowercases to the valid 'inv'
+  // (normalization runs before validation), asserted separately below.
+  for (const bad of [
+    "",                       // empty
+    "a",                      // too short (min 2)
+    "1abc",                   // leading digit
+    "tenant-probe",           // hyphen (separator forbidden)
+    "tenant_probe",           // underscore (separator forbidden)
+    "abcdefghij0123456789x",  // 21 chars (max 20)
+    "föö",                    // non-ASCII homoglyph
+    "a; DROP DATABASE x; --", // injection
+    "a b",                    // space
+  ]) {
+    assert(!isValidTenantSlug(bad), `invalid slug rejected: ${JSON.stringify(bad)}`);
+    assert(tryNormalizeTenantSlug(bad) === null, `invalid slug → null: ${JSON.stringify(bad)}`);
+  }
+  // 'Inv' → 'inv' is genuinely valid (lowercasing happens first)
+  assert(tryNormalizeTenantSlug("Inv") === "inv", "'Inv' normalizes to valid 'inv'");
+
+  // Invalid: reserved tokens + reserved prefixes
+  for (const reserved of ["rig", "control", "postgres", "public", "default", "admin", "kube", "flux"]) {
+    assert(!isValidTenantSlug(reserved), `reserved token rejected: '${reserved}'`);
+  }
+  for (const pfx of ["pgfoo", "pg1", "kubexyz", "kube1"]) {
+    assert(!isValidTenantSlug(pfx), `reserved-prefix slug rejected: '${pfx}'`);
+  }
+  // Non-string inputs
+  for (const x of [null, undefined, 42, {}, []]) {
+    assert(tryNormalizeTenantSlug(x) === null, `non-string → null: ${JSON.stringify(x) ?? String(x)}`);
+  }
+  // normalizeTenantSlug throws on invalid
+  let threw = false;
+  try { normalizeTenantSlug("tenant-probe"); } catch { threw = true; }
+  assert(threw, "normalizeTenantSlug throws on an invalid slug");
+
+  console.log("\n=== Tenant: memory DB name (frozen rig_t_<id>_mem) ===");
+  assert(memoryDbName("invotek") === "rig_t_invotek_mem", "memoryDbName('invotek') = rig_t_invotek_mem");
+  assert(memoryDbName("acme") === "rig_t_acme_mem", "memoryDbName('acme') = rig_t_acme_mem");
+
+  console.log("\n=== Tenant: resolveTenantBinding ===");
+  assert(resolveTenantBinding({}).multiTenant === false, "no TENANT_ID → single-tenant/legacy");
+  assert(resolveTenantBinding({ TENANT_ID: "" }).multiTenant === false, "blank TENANT_ID → legacy");
+  assert(resolveTenantBinding({ TENANT_ID: "   " }).multiTenant === false, "whitespace TENANT_ID → legacy");
+  const b = resolveTenantBinding({ TENANT_ID: "acme" });
+  assert(b.multiTenant === true, "TENANT_ID set → multi-tenant");
+  assert(b.tenantId === "acme" && b.expectedDb === "rig_t_acme_mem", "binding carries id + expectedDb");
+  // Invalid TENANT_ID must throw (fail closed, never default)
+  let bthrew = false;
+  try { resolveTenantBinding({ TENANT_ID: "rig" }); } catch { bthrew = true; }
+  assert(bthrew, "reserved TENANT_ID throws (fail closed)");
+
+  console.log("\n=== Tenant: forbidden tool-arg guard ===");
+  assert(findForbiddenTenantArg(undefined) === null, "no args → null");
+  assert(findForbiddenTenantArg({ query: "x" }) === null, "clean args → null");
+  for (const key of ["tenant", "tenant_id", "tenantId", "db", "db_url", "dbUrl"]) {
+    assert(findForbiddenTenantArg({ [key]: "x" }) !== null, `forbidden arg '${key}' is rejected`);
+  }
 }
 
 // ---------- SQLite tests ----------
@@ -457,16 +538,141 @@ async function runPostgresTests() {
   await pool.query("DELETE FROM rig_memory WHERE repo = 'dashecorp/compact-test'");
 }
 
+// ---------- Tenant DB-isolation tests (rc#1478) ----------
+
+/**
+ * Prove HARD per-tenant isolation: two real per-tenant databases (rig_t_isoa_mem,
+ * rig_t_isob_mem), a write under tenant A is NEVER visible from tenant B's connection —
+ * because B's pool is connected to a DIFFERENT DATABASE, not because a filter excluded it.
+ * Also proves assertCurrentDatabase fails closed on a wrong connection.
+ *
+ * STRONG NEGATIVE ORACLE: each tenant writes its OWN marker, and the cross-tenant assertions
+ * check that B's query RETURNS B's marker but NOT A's (and vice-versa) — not merely that the
+ * result set is empty. An always-returns-nothing query bug therefore cannot masquerade as
+ * isolation: the test only passes if the query actually works AND is physically isolated.
+ *
+ * Requires CREATEDB privilege (the CI pgvector superuser has it). Returns `true` when the
+ * isolation assertions actually ran, `false` when it had to skip (no CREATEDB) — the caller
+ * (main) HARD-FAILS on a skip in the security lane so this load-bearing test can never
+ * silently no-op while CI reports green. A constrained local env may opt out explicitly with
+ * ALLOW_SKIP_ISOLATION_TEST=true.
+ *
+ * @returns {Promise<boolean>} true iff the cross-tenant isolation assertions executed
+ */
+async function runTenantIsolationTests() {
+  console.log("\n=== Postgres: tenant DB-per-tenant isolation (rc#1478) ===");
+
+  const dbA = memoryDbName("isoa"); // rig_t_isoa_mem
+  const dbB = memoryDbName("isob"); // rig_t_isob_mem
+
+  // Derive a per-DB DSN from the admin DB_URL by swapping the database name.
+  const dsnFor = (dbName) => {
+    const u = new URL(process.env.DB_URL);
+    u.pathname = `/${dbName}`;
+    return u.toString();
+  };
+
+  // Create the two tenant databases (DROP first for idempotency). CREATE/DROP DATABASE cannot
+  // run in a transaction — pg auto-commits single statements, so these are fine.
+  try {
+    for (const db of [dbA, dbB]) {
+      await pool.query(`DROP DATABASE IF EXISTS ${db}`);
+      await pool.query(`CREATE DATABASE ${db}`);
+    }
+  } catch (e) {
+    console.log(`  skip: cannot CREATE DATABASE (${e.message}) — needs CREATEDB`);
+    return false; // caller hard-fails in the security lane unless ALLOW_SKIP_ISOLATION_TEST=true
+  }
+
+  const A_TITLE = "TENANT-A-ONLY pgvector isolation marker";
+  const B_TITLE = "TENANT-B-ONLY pgvector isolation marker";
+
+  const { Pool } = (await import("pg")).default;
+  let poolA, poolB;
+  try {
+    poolA = new Pool({ connectionString: dsnFor(dbA) });
+    poolB = new Pool({ connectionString: dsnFor(dbB) });
+
+    // assertCurrentDatabase passes for the right name, throws for the wrong one.
+    const okName = await assertCurrentDatabase(poolA, dbA);
+    assert(okName === dbA, `assertCurrentDatabase passes when connected to ${dbA}`);
+    let mismatchThrew = false;
+    try { await assertCurrentDatabase(poolA, dbB); } catch { mismatchThrew = true; }
+    assert(mismatchThrew, "assertCurrentDatabase throws when expected != actual (fail closed)");
+
+    // Init schema in each tenant DB, then each tenant writes its OWN marker.
+    await initSchema(poolA);
+    await initSchema(poolB);
+    const mk = (title) => ({
+      agent_role: "iso-agent", written_by_agent: "iso-agent", repo: "dashecorp/iso-test",
+      scope: "project", kind: "decision", title,
+      content: `${title} — must surface ONLY under its own tenant's database.`,
+      tags: ["iso"], importance: 5,
+    });
+    await insertMemory(poolA, mk(A_TITLE));
+    await insertMemory(poolB, mk(B_TITLE));
+
+    const search = (p) => searchMemories(p, {
+      query: "isolation marker", agent_role: null, repo: null, issue_id: null, limit: 10, embedding: null,
+    });
+
+    // STRONG ORACLE — A sees ONLY A; the same query under B sees ONLY B. The query demonstrably
+    // works (each returns its own marker), so "B never returns A" is genuine isolation, not an
+    // always-empty result. This is the load-bearing cross-tenant-bleed proof.
+    const aHits = await search(poolA);
+    assert(aHits.some((r) => r.title === A_TITLE), "tenant A's query returns A's own marker (query works)");
+    assert(!aHits.some((r) => r.title === B_TITLE), "tenant A NEVER returns tenant B's marker (DB isolation, not a filter)");
+
+    const bHits = await search(poolB);
+    assert(bHits.some((r) => r.title === B_TITLE), "tenant B's query returns B's own marker (query works)");
+    assert(!bHits.some((r) => r.title === A_TITLE), "tenant B NEVER returns tenant A's marker (DB isolation, not a filter)");
+
+    // listRecent is likewise physically scoped to each tenant's database.
+    const aRecent = await listRecent(poolA, { agent_role: null, repo: null, limit: 100 });
+    assert(aRecent.some((r) => r.title === A_TITLE), "tenant A listRecent shows A's marker");
+    assert(!aRecent.some((r) => r.title === B_TITLE), "tenant A listRecent NEVER shows tenant B's marker");
+    const bRecent = await listRecent(poolB, { agent_role: null, repo: null, limit: 100 });
+    assert(bRecent.some((r) => r.title === B_TITLE), "tenant B listRecent shows B's marker");
+    assert(!bRecent.some((r) => r.title === A_TITLE), "tenant B listRecent NEVER shows tenant A's marker");
+
+    return true; // the isolation assertions executed
+  } finally {
+    await poolA?.end();
+    await poolB?.end();
+    // Drop the tenant DBs (can't drop a DB with open connections — pools are closed above).
+    for (const db of [dbA, dbB]) {
+      try { await pool.query(`DROP DATABASE IF EXISTS ${db}`); } catch { /* best-effort cleanup */ }
+    }
+  }
+}
+
 // ---------- Main ----------
 
 async function main() {
-  console.log("=== SQLite Backend Tests ===");
+  console.log("=== Tenant Binding Tests (rc#1478) ===");
+  runTenantTests();
+
+  console.log("\n=== SQLite Backend Tests ===");
   await runSqliteTests();
 
   if (process.env.DB_URL) {
     console.log("\n=== Postgres Backend Tests ===");
     try {
       await runPostgresTests();
+      const isolationRan = await runTenantIsolationTests();
+      // The cross-tenant isolation suite is the load-bearing proof of the rig's top-stated
+      // failure mode (memory bleed). It must never silently skip-and-pass: when DB_URL is set
+      // (the security lane), a skip is a HARD FAIL unless explicitly opted out for a constrained
+      // local env. This stops a future least-privilege PG role from turning it into a no-op while
+      // CI stays green.
+      const allowSkip = process.env.ALLOW_SKIP_ISOLATION_TEST === "true";
+      assert(
+        isolationRan || allowSkip,
+        "cross-tenant DB-isolation suite executed (needs CREATEDB; set ALLOW_SKIP_ISOLATION_TEST=true to bypass in a constrained env)"
+      );
+      if (!isolationRan && allowSkip) {
+        console.log("  WARN: isolation suite skipped via ALLOW_SKIP_ISOLATION_TEST — the core security property was NOT exercised this run");
+      }
     } finally {
       await pool?.end();
     }
