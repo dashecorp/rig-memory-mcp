@@ -12,7 +12,6 @@
 import {
   createPool,
   initSchema,
-  assertCurrentDatabase,
   insertMemory,
   searchMemories,
   listRecent,
@@ -538,115 +537,12 @@ async function runPostgresTests() {
   await pool.query("DELETE FROM rig_memory WHERE repo = 'dashecorp/compact-test'");
 }
 
-// ---------- Tenant DB-isolation tests (rc#1478) ----------
-
-/**
- * Prove HARD per-tenant isolation: two real per-tenant databases (rig_t_isoa_mem,
- * rig_t_isob_mem), a write under tenant A is NEVER visible from tenant B's connection —
- * because B's pool is connected to a DIFFERENT DATABASE, not because a filter excluded it.
- * Also proves assertCurrentDatabase fails closed on a wrong connection.
- *
- * STRONG NEGATIVE ORACLE: each tenant writes its OWN marker, and the cross-tenant assertions
- * check that B's query RETURNS B's marker but NOT A's (and vice-versa) — not merely that the
- * result set is empty. An always-returns-nothing query bug therefore cannot masquerade as
- * isolation: the test only passes if the query actually works AND is physically isolated.
- *
- * Requires CREATEDB privilege (the CI pgvector superuser has it). Returns `true` when the
- * isolation assertions actually ran, `false` when it had to skip (no CREATEDB) — the caller
- * (main) HARD-FAILS on a skip in the security lane so this load-bearing test can never
- * silently no-op while CI reports green. A constrained local env may opt out explicitly with
- * ALLOW_SKIP_ISOLATION_TEST=true.
- *
- * @returns {Promise<boolean>} true iff the cross-tenant isolation assertions executed
- */
-async function runTenantIsolationTests() {
-  console.log("\n=== Postgres: tenant DB-per-tenant isolation (rc#1478) ===");
-
-  const dbA = memoryDbName("isoa"); // rig_t_isoa_mem
-  const dbB = memoryDbName("isob"); // rig_t_isob_mem
-
-  // Derive a per-DB DSN from the admin DB_URL by swapping the database name.
-  const dsnFor = (dbName) => {
-    const u = new URL(process.env.DB_URL);
-    u.pathname = `/${dbName}`;
-    return u.toString();
-  };
-
-  // Create the two tenant databases (DROP first for idempotency). CREATE/DROP DATABASE cannot
-  // run in a transaction — pg auto-commits single statements, so these are fine.
-  try {
-    for (const db of [dbA, dbB]) {
-      await pool.query(`DROP DATABASE IF EXISTS ${db}`);
-      await pool.query(`CREATE DATABASE ${db}`);
-    }
-  } catch (e) {
-    console.log(`  skip: cannot CREATE DATABASE (${e.message}) — needs CREATEDB`);
-    return false; // caller hard-fails in the security lane unless ALLOW_SKIP_ISOLATION_TEST=true
-  }
-
-  const A_TITLE = "TENANT-A-ONLY pgvector isolation marker";
-  const B_TITLE = "TENANT-B-ONLY pgvector isolation marker";
-
-  const { Pool } = (await import("pg")).default;
-  let poolA, poolB;
-  try {
-    poolA = new Pool({ connectionString: dsnFor(dbA) });
-    poolB = new Pool({ connectionString: dsnFor(dbB) });
-
-    // assertCurrentDatabase passes for the right name, throws for the wrong one.
-    const okName = await assertCurrentDatabase(poolA, dbA);
-    assert(okName === dbA, `assertCurrentDatabase passes when connected to ${dbA}`);
-    let mismatchThrew = false;
-    try { await assertCurrentDatabase(poolA, dbB); } catch { mismatchThrew = true; }
-    assert(mismatchThrew, "assertCurrentDatabase throws when expected != actual (fail closed)");
-
-    // Init schema in each tenant DB, then each tenant writes its OWN marker.
-    await initSchema(poolA);
-    await initSchema(poolB);
-    const mk = (title) => ({
-      agent_role: "iso-agent", written_by_agent: "iso-agent", repo: "dashecorp/iso-test",
-      scope: "project", kind: "decision", title,
-      content: `${title} — must surface ONLY under its own tenant's database.`,
-      tags: ["iso"], importance: 5,
-    });
-    await insertMemory(poolA, mk(A_TITLE));
-    await insertMemory(poolB, mk(B_TITLE));
-
-    const search = (p) => searchMemories(p, {
-      query: "isolation marker", agent_role: null, repo: null, issue_id: null, limit: 10, embedding: null,
-    });
-
-    // STRONG ORACLE — A sees ONLY A; the same query under B sees ONLY B. The query demonstrably
-    // works (each returns its own marker), so "B never returns A" is genuine isolation, not an
-    // always-empty result. This is the load-bearing cross-tenant-bleed proof.
-    const aHits = await search(poolA);
-    assert(aHits.some((r) => r.title === A_TITLE), "tenant A's query returns A's own marker (query works)");
-    assert(!aHits.some((r) => r.title === B_TITLE), "tenant A NEVER returns tenant B's marker (DB isolation, not a filter)");
-
-    const bHits = await search(poolB);
-    assert(bHits.some((r) => r.title === B_TITLE), "tenant B's query returns B's own marker (query works)");
-    assert(!bHits.some((r) => r.title === A_TITLE), "tenant B NEVER returns tenant A's marker (DB isolation, not a filter)");
-
-    // listRecent is likewise physically scoped to each tenant's database.
-    const aRecent = await listRecent(poolA, { agent_role: null, repo: null, limit: 100 });
-    assert(aRecent.some((r) => r.title === A_TITLE), "tenant A listRecent shows A's marker");
-    assert(!aRecent.some((r) => r.title === B_TITLE), "tenant A listRecent NEVER shows tenant B's marker");
-    const bRecent = await listRecent(poolB, { agent_role: null, repo: null, limit: 100 });
-    assert(bRecent.some((r) => r.title === B_TITLE), "tenant B listRecent shows B's marker");
-    assert(!bRecent.some((r) => r.title === A_TITLE), "tenant B listRecent NEVER shows tenant A's marker");
-
-    return true; // the isolation assertions executed
-  } finally {
-    await poolA?.end();
-    await poolB?.end();
-    // Drop the tenant DBs (can't drop a DB with open connections — pools are closed above).
-    for (const db of [dbA, dbB]) {
-      try { await pool.query(`DROP DATABASE IF EXISTS ${db}`); } catch { /* best-effort cleanup */ }
-    }
-  }
-}
-
 // ---------- Main ----------
+//
+// The cross-tenant DB-isolation suite (proves a write under tenant A is physically
+// invisible to tenant B's connection, and assertCurrentDatabase fails closed on a
+// wrong DB) ships with the adapter wiring in the Part 2 follow-up, not this PR —
+// it depends on assertCurrentDatabase + the createBackend multi-tenant code path.
 
 async function main() {
   console.log("=== Tenant Binding Tests (rc#1478) ===");
@@ -659,20 +555,6 @@ async function main() {
     console.log("\n=== Postgres Backend Tests ===");
     try {
       await runPostgresTests();
-      const isolationRan = await runTenantIsolationTests();
-      // The cross-tenant isolation suite is the load-bearing proof of the rig's top-stated
-      // failure mode (memory bleed). It must never silently skip-and-pass: when DB_URL is set
-      // (the security lane), a skip is a HARD FAIL unless explicitly opted out for a constrained
-      // local env. This stops a future least-privilege PG role from turning it into a no-op while
-      // CI stays green.
-      const allowSkip = process.env.ALLOW_SKIP_ISOLATION_TEST === "true";
-      assert(
-        isolationRan || allowSkip,
-        "cross-tenant DB-isolation suite executed (needs CREATEDB; set ALLOW_SKIP_ISOLATION_TEST=true to bypass in a constrained env)"
-      );
-      if (!isolationRan && allowSkip) {
-        console.log("  WARN: isolation suite skipped via ALLOW_SKIP_ISOLATION_TEST — the core security property was NOT exercised this run");
-      }
     } finally {
       await pool?.end();
     }

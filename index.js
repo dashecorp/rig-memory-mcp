@@ -27,7 +27,6 @@ import {
 import {
   createPool,
   initSchema,
-  assertCurrentDatabase,
   insertMemory,
   searchMemories,
   listRecent,
@@ -36,7 +35,6 @@ import {
   createSqliteBackend,
 } from "./db.js";
 import { emitMemoryWrite, emitMemoryRead, emitMemoryHitUsed } from "./events.js";
-import { resolveTenantBinding, findForbiddenTenantArg } from "./tenant.js";
 
 // ---------- Config ----------
 
@@ -68,51 +66,14 @@ class PostgresBackend {
 
 /**
  * Determine which backend to use based on env vars.
- *
- * Two modes:
- *  - MULTI-TENANT (`TENANT_ID` set, rc#1478): hard per-tenant isolation. REQUIRES a Postgres
- *    DSN that lands on this tenant's own database (`rig_t_<id>_mem`); there is NO SQLite
- *    fallback (a single file could silently merge two tenants) and the connected database is
- *    asserted to equal the derived name. Any failure is fatal — fail closed, never default.
- *  - SINGLE-TENANT / LEGACY (`TENANT_ID` absent): unchanged. Postgres (DB_URL) → SQLite
- *    fallback / no-DB_URL. Tenant-0 (invotek) runs here until its memory plane is cut over.
+ * Priority: Postgres (DB_URL) → SQLite fallback / no-DB_URL.
  *
  * @returns {Promise<PostgresBackend|import('./db.js').SqliteBackend>}
  */
 async function createBackend() {
   const dbUrl = process.env.DB_URL;
   const strict = process.env.MEMORY_STRICT === "true";
-  // resolveTenantBinding throws on an invalid TENANT_ID → fail closed before any connection.
-  const tenant = resolveTenantBinding(process.env);
 
-  // ----- Multi-tenant mode: hard DB-per-tenant isolation, no fallback -----
-  if (tenant.multiTenant) {
-    console.error(
-      `[rig-memory] TENANT_ID=${tenant.tenantId} — multi-tenant mode (DB ${tenant.expectedDb}, no SQLite fallback)`
-    );
-    if (!dbUrl) {
-      console.error(
-        `[rig-memory] FATAL: multi-tenant mode requires a per-tenant Postgres DB_URL ` +
-          `(${tenant.expectedDb}). SQLite fallback is disabled so two tenants can never share a file.`
-      );
-      process.exit(1);
-    }
-    try {
-      const pool = await createPool();
-      // Defense-in-depth: the injected DSN MUST land on this tenant's own database.
-      await assertCurrentDatabase(pool, tenant.expectedDb);
-      await initSchema(pool);
-      console.error(`[rig-memory] Postgres connected to ${tenant.expectedDb}, schema ready`);
-      return new PostgresBackend(pool);
-    } catch (pgErr) {
-      console.error(
-        `[rig-memory] FATAL: multi-tenant Postgres setup failed: ${pgErr.message} — refusing to start (no fallback)`
-      );
-      process.exit(1);
-    }
-  }
-
-  // ----- Single-tenant / legacy mode: Postgres → SQLite fallback -----
   if (dbUrl) {
     console.error("[rig-memory] DB_URL set — connecting to Postgres");
     try {
@@ -360,15 +321,6 @@ async function main() {
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: args } = req.params;
-
-    // Defense-in-depth (rc#1478): the tenant binding is server-resolved at startup and is
-    // NEVER a tool argument. Reject any request that tries to assert a tenant or a raw DSN —
-    // a poisoned issue/PR/Discord body could instruct an agent to do exactly this.
-    const forbidden = findForbiddenTenantArg(args);
-    if (forbidden) {
-      console.error(`[rig-memory] Rejected tool call (${name}): ${forbidden}`);
-      return err(forbidden);
-    }
 
     try {
       switch (name) {

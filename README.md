@@ -28,28 +28,24 @@ DB_URL=postgres://... AGENT_ROLE=dev-e node index.js
 | `REPO` | — | `""` | Default repo slug for `write_memory` |
 | `OPENAI_API_KEY` | — | — | Enables semantic embeddings (text-embedding-3-small) |
 | `OPENAI_BASE_URL` | — | OpenAI default | Override base URL for OpenAI-compatible endpoints |
-| `TENANT_ID` | — | — | **Multi-tenant mode (rc#1478).** When set, binds this process to one tenant; see below |
-| `MEMORY_STRICT` | — | `false` | Single-tenant mode only: exit instead of SQLite-fallback on Postgres failure |
+| `MEMORY_STRICT` | — | `false` | Exit instead of SQLite-fallback on Postgres failure |
 
 Without `OPENAI_API_KEY`, the server runs in **text-only mode** (BM25/tsvector search only).
 
-## Multi-tenancy — hard memory isolation (rc#1478)
+## Multi-tenancy policy (rc#1478, Part A — policy module)
 
-The rig is multi-tenant: each tenant's agent memory is **physically isolated in its own Postgres+pgvector database** (`rig_t_<id>_mem`), not a shared table with a `tenant_id` filter. *The LLM is the threat model, not the guard* — a forgotten or prompt-injected retrieval predicate on a shared table is a leak; a wrong database connection simply cannot return another tenant's rows.
+The rig will give each tenant a **physically separate Postgres+pgvector database** (`rig_t_<id>_mem`), not a shared table with a `tenant_id` filter. *The LLM is the threat model, not the guard* — a forgotten or prompt-injected retrieval predicate on a shared table is a leak; a wrong database connection simply cannot return another tenant's rows.
 
-This MCP server is **one process per agent** (stdio), so the tenant boundary is the **process**, bound once at startup from the server-trusted `TENANT_ID` env var (set by the conductor when it materializes the agent's pod/session) — **never** from an MCP tool argument.
+This PR lands the **policy module only** (`tenant.js`):
 
-**Multi-tenant mode** (`TENANT_ID` set):
+- Slug grammar + reserved blocklist + `pg`/`kube` prefix block, **ported verbatim** from rig-conductor's `TenantId` (`^[a-z][a-z0-9]{1,19}$`, 2–20 chars, no leading digit). Keep in sync — a slug the conductor accepts but this server rejects (or vice-versa) splits the per-tenant DB name.
+- Frozen per-tenant DB-name convention: `rig_t_<id>_mem`.
+- `resolveTenantBinding(env)` reads the server-trusted `TENANT_ID` env var (never an MCP tool argument) and returns either legacy/single-tenant mode (no `TENANT_ID`) or a multi-tenant binding `{ tenantId, expectedDb }` — fail-closed throw on an invalid slug, never default.
+- `findForbiddenTenantArg(args)` rejects any tool-call payload that smuggles `tenant`/`tenant_id`/`db`/`db_url`.
 
-- The tenant slug is validated against the frozen naming convention (`^[a-z][a-z0-9]{1,19}$` + reserved blocklist, ported from rig-conductor's `TenantId`). An invalid `TENANT_ID` is fatal — fail closed, never default.
-- A per-tenant Postgres `DB_URL` pointing at `rig_t_<id>_mem` is **required**. There is **no SQLite fallback** (a single file could silently merge two tenants), and the live connection is asserted to equal `rig_t_<id>_mem` — a misconfigured DSN that lands on the wrong (or a shared) database is refused at startup.
-- Provisioning a tenant's `rig_t_<id>_mem` database is a deliberate operator/onboarding step; the server never `CREATE DATABASE`s. An unknown tenant's DB does not exist → the server refuses to start.
-- **Isolation is the connection, full stop:** there is no `tenant_id` column and no retrieval-time tenant filter on `rig_memory`. Tool arguments that try to assert a tenant or a raw DSN (`tenant`, `tenant_id`, `db`, `db_url`, …) are hard-rejected.
-- **Right to erasure:** dropping `rig_t_<id>_mem` is complete, orphan-free erasure of that tenant's memory plane.
+**Not yet wired** in this PR — staged for the Part 2 follow-up: the `createBackend` multi-tenant code path that **requires** a per-tenant `DB_URL`, **asserts** it lands on `rig_t_<id>_mem` at startup (`assertCurrentDatabase`), disables the SQLite fallback, and refuses to start on mismatch — and the cross-tenant DB-isolation integration test that proves it. Setting `TENANT_ID` has **no runtime effect** until Part 2 lands.
 
-**Single-tenant / legacy mode** (`TENANT_ID` unset): unchanged — Postgres (`DB_URL`) with SQLite fallback. Tenant-0 (`invotek`) runs here until its memory plane is cut over to `rig_t_invotek_mem`.
-
-> **Conductor wiring (Part B of rc#1478)** — injecting the per-tenant `DB_URL`/secret-ref into the agent session via the P0 `ITenantResolver` / `Tenant` registry — lands when per-tenant agent pods exist (gated on the namespace-per-tenant item #1482). This server is ready for it now.
+> **Conductor wiring (Part B of rc#1478)** — injecting the per-tenant `DB_URL`/secret-ref into the agent session via the P0 `ITenantResolver` / `Tenant` registry — lands when per-tenant agent pods exist (gated on the namespace-per-tenant item #1482).
 
 ## Database schema
 

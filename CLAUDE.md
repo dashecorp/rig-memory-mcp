@@ -7,15 +7,14 @@ MCP server providing persistent, searchable agent memory backed by Postgres + pg
 ```
 rig-memory-mcp/
 ├── index.js       # MCP server — tool definitions and handlers
-├── db.js          # Postgres layer — schema, queries, tenant-DB assertion
-├── tenant.js      # Multi-tenancy (rc#1478) — slug validation + per-tenant DB binding
-├── test.js        # Integration tests (tenant + SQLite always; Postgres + isolation with DB_URL)
+├── db.js          # Postgres layer — schema and queries
+├── tenant.js      # Multi-tenancy (rc#1478) — slug validation + per-tenant DB binding (policy only; adapter wiring lands in the follow-up)
+├── test.js        # Integration tests (tenant unit + SQLite always; Postgres with DB_URL)
 ├── Dockerfile     # Production image (node:22-alpine)
 ├── package.json
 ├── README.md
 └── docs/
-    ├── api.md                              # Full tool API reference
-    └── 2026-06-12-multi-tenancy-db-per-tenant.md  # rc#1478 design + isolation model
+    └── api.md                              # Full tool API reference
 ```
 
 ## Tech stack
@@ -51,7 +50,7 @@ rig-memory-mcp/
 | `REPO` | — | Default repo for writes |
 | `OPENAI_API_KEY` | — | Enables embedding generation |
 | `OPENAI_BASE_URL` | — | Override OpenAI base URL |
-| `TENANT_ID` | — | **Multi-tenant mode (rc#1478).** Binds the process to one tenant → requires a `rig_t_<id>_mem` DB, no SQLite fallback. See `tenant.js` + README §Multi-tenancy |
+| `TENANT_ID` | — | Reserved for **multi-tenant mode (rc#1478)**. The policy module that validates this var lives in `tenant.js`; the createBackend wiring + DB assertion that *enforce* it ship in the Part 2 follow-up — until then setting `TENANT_ID` has no runtime effect |
 
 ## Running tests
 
