@@ -2,6 +2,7 @@ name: release-please
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,4 +14,9 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Prefer a PAT (RELEASE_PAT) when set so release-please can create
+          # PRs even if the repo/org has "Allow GitHub Actions to create and
+          # approve pull requests" disabled. Fall back to github.token so the
+          # workflow doesn't hard-fail on unset/empty secret. See
+          # docs/troubleshooting.md for the failure modes this guards against.
+          token: ${{ secrets.RELEASE_PAT || github.token }}
