@@ -28,8 +28,24 @@ DB_URL=postgres://... AGENT_ROLE=dev-e node index.js
 | `REPO` | — | `""` | Default repo slug for `write_memory` |
 | `OPENAI_API_KEY` | — | — | Enables semantic embeddings (text-embedding-3-small) |
 | `OPENAI_BASE_URL` | — | OpenAI default | Override base URL for OpenAI-compatible endpoints |
+| `MEMORY_STRICT` | — | `false` | Exit instead of SQLite-fallback on Postgres failure |
 
 Without `OPENAI_API_KEY`, the server runs in **text-only mode** (BM25/tsvector search only).
+
+## Multi-tenancy policy (rc#1478, Part A — policy module)
+
+The rig will give each tenant a **physically separate Postgres+pgvector database** (`rig_t_<id>_mem`), not a shared table with a `tenant_id` filter. *The LLM is the threat model, not the guard* — a forgotten or prompt-injected retrieval predicate on a shared table is a leak; a wrong database connection simply cannot return another tenant's rows.
+
+This PR lands the **policy module only** (`tenant.js`):
+
+- Slug grammar + reserved blocklist + `pg`/`kube` prefix block, **ported verbatim** from rig-conductor's `TenantId` (`^[a-z][a-z0-9]{1,19}$`, 2–20 chars, no leading digit). Keep in sync — a slug the conductor accepts but this server rejects (or vice-versa) splits the per-tenant DB name.
+- Frozen per-tenant DB-name convention: `rig_t_<id>_mem`.
+- `resolveTenantBinding(env)` reads the server-trusted `TENANT_ID` env var (never an MCP tool argument) and returns either legacy/single-tenant mode (no `TENANT_ID`) or a multi-tenant binding `{ tenantId, expectedDb }` — fail-closed throw on an invalid slug, never default.
+- `findForbiddenTenantArg(args)` rejects any tool-call payload that smuggles `tenant`/`tenant_id`/`db`/`db_url`.
+
+**Not yet wired** in this PR — staged for the Part 2 follow-up: the `createBackend` multi-tenant code path that **requires** a per-tenant `DB_URL`, **asserts** it lands on `rig_t_<id>_mem` at startup (`assertCurrentDatabase`), disables the SQLite fallback, and refuses to start on mismatch — and the cross-tenant DB-isolation integration test that proves it. Setting `TENANT_ID` has **no runtime effect** until Part 2 lands.
+
+> **Conductor wiring (Part B of rc#1478)** — injecting the per-tenant `DB_URL`/secret-ref into the agent session via the P0 `ITenantResolver` / `Tenant` registry — lands when per-tenant agent pods exist (gated on the namespace-per-tenant item #1482).
 
 ## Database schema
 
