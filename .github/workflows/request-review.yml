@@ -27,7 +27,14 @@ jobs:
             const action = context.payload.action;
             const pr_author = context.payload.pull_request.user.login;
 
-            if (pr_author === 'review-e-dashecorp') {
+            // Review-E posts reviews as the review-e-bot[bot] GitHub App; the legacy
+            // review-e-dashecorp user account is being retired. Match BOTH so a
+            // CHANGES_REQUESTED from review-e-bot[bot] is detected on synchronize and
+            // the re-review fires (claude-3#745/#746; rig-memory-mcp was not in that
+            // Stig-Johnny sweep). Without this the stale review never clears (issue #25).
+            const REVIEW_E_LOGINS = ['review-e-bot[bot]', 'review-e-dashecorp'];
+
+            if (REVIEW_E_LOGINS.includes(pr_author)) {
               core.setOutput('should_request', 'false');
               core.setOutput('is_rerequest', 'false');
               console.log('PR author is Review-E, skipping');
@@ -46,7 +53,7 @@ jobs:
               );
 
               const reviewEReviews = reviews
-                .filter(r => r.user.login === 'review-e-dashecorp')
+                .filter(r => REVIEW_E_LOGINS.includes(r.user.login))
                 .sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at));
 
               if (reviewEReviews.length > 0 && reviewEReviews[0].state === 'CHANGES_REQUESTED') {
