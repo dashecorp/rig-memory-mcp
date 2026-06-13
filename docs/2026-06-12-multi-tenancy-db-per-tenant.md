@@ -1,6 +1,8 @@
 ---
 title: "Memory-plane multi-tenancy: DB-per-tenant (rc#1478)"
+description: "Why per-tenant agent memory ships as physically separate Postgres+pgvector databases (rig_t_<id>_mem), not a shared table with a tenant_id filter."
 type: decision
+audience: both
 status: accepted
 created: "2026-06-12"
 updated: "2026-06-13"
