@@ -27,6 +27,7 @@ import {
 import {
   createPool,
   initSchema,
+  assertCurrentDatabase,
   insertMemory,
   searchMemories,
   listRecent,
@@ -34,6 +35,7 @@ import {
   compactRepo,
   createSqliteBackend,
 } from "./db.js";
+import { resolveTenantBinding, findForbiddenTenantArg } from "./tenant.js";
 import { emitMemoryWrite, emitMemoryRead, emitMemoryHitUsed } from "./events.js";
 
 // ---------- Config ----------
@@ -73,6 +75,37 @@ class PostgresBackend {
 async function createBackend() {
   const dbUrl = process.env.DB_URL;
   const strict = process.env.MEMORY_STRICT === "true";
+
+  // ── Multi-tenant mode (rc#1478 Part 2) ──────────────────────────────────────
+  // TENANT_ID set ⟹ hard isolation = ONE Postgres+pgvector DB per tenant. REQUIRE a per-tenant DSN,
+  // ASSERT the connection lands on rig_t_<id>_mem BEFORE initSchema, NO SQLite fallback, FATAL on any
+  // failure. resolveTenantBinding throws on an invalid TENANT_ID (fail closed, never defaults).
+  const binding = resolveTenantBinding();
+  if (binding.multiTenant) {
+    if (!dbUrl) {
+      console.error(
+        `[rig-memory] FATAL: TENANT_ID='${binding.tenantId}' is set but DB_URL is missing — ` +
+          "multi-tenant mode requires a per-tenant Postgres DSN (the SQLite fallback is disabled)"
+      );
+      process.exit(1);
+    }
+    try {
+      const pool = await createPool();
+      // Assert BEFORE initSchema so a wrong-DB DSN never even creates the schema in the wrong place.
+      await assertCurrentDatabase(pool, binding.expectedDb);
+      await initSchema(pool);
+      console.error(
+        `[rig-memory] multi-tenant: bound to tenant '${binding.tenantId}' on DB '${binding.expectedDb}'`
+      );
+      return new PostgresBackend(pool);
+    } catch (e) {
+      console.error(
+        `[rig-memory] FATAL: multi-tenant startup failed for tenant '${binding.tenantId}': ${e.message}`
+      );
+      process.exit(1);
+    }
+  }
+  // ── Legacy single-tenant mode (TENANT_ID unset) — unchanged ─────────────────
 
   if (dbUrl) {
     console.error("[rig-memory] DB_URL set — connecting to Postgres");
@@ -321,6 +354,11 @@ async function main() {
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: args } = req.params;
+
+    // rc#1478: the tenant binding is server-resolved (TENANT_ID env), NEVER a tool argument. Hard-reject
+    // any call that smuggles a tenant/db override — defense in depth ("the LLM is the threat model").
+    const forbidden = findForbiddenTenantArg(args);
+    if (forbidden) return err(forbidden);
 
     try {
       switch (name) {

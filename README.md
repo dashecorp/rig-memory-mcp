@@ -32,18 +32,25 @@ DB_URL=postgres://... AGENT_ROLE=dev-e node index.js
 
 Without `OPENAI_API_KEY`, the server runs in **text-only mode** (BM25/tsvector search only).
 
-## Multi-tenancy policy (rc#1478, Part A — policy module)
+## Multi-tenancy (rc#1478 — per-tenant DB isolation)
 
-The rig will give each tenant a **physically separate Postgres+pgvector database** (`rig_t_<id>_mem`), not a shared table with a `tenant_id` filter. *The LLM is the threat model, not the guard* — a forgotten or prompt-injected retrieval predicate on a shared table is a leak; a wrong database connection simply cannot return another tenant's rows.
+Each tenant gets a **physically separate Postgres+pgvector database** (`rig_t_<id>_mem`), not a shared table with a `tenant_id` filter. *The LLM is the threat model, not the guard* — a forgotten or prompt-injected retrieval predicate on a shared table is a leak; a wrong database connection simply cannot return another tenant's rows.
 
-This PR lands the **policy module only** (`tenant.js`):
+**Policy** (`tenant.js`):
 
 - Slug grammar + reserved blocklist + `pg`/`kube` prefix block, **ported verbatim** from rig-conductor's `TenantId` (`^[a-z][a-z0-9]{1,19}$`, 2–20 chars, no leading digit). Keep in sync — a slug the conductor accepts but this server rejects (or vice-versa) splits the per-tenant DB name.
 - Frozen per-tenant DB-name convention: `rig_t_<id>_mem`.
 - `resolveTenantBinding(env)` reads the server-trusted `TENANT_ID` env var (never an MCP tool argument) and returns either legacy/single-tenant mode (no `TENANT_ID`) or a multi-tenant binding `{ tenantId, expectedDb }` — fail-closed throw on an invalid slug, never default.
 - `findForbiddenTenantArg(args)` rejects any tool-call payload that smuggles `tenant`/`tenant_id`/`db`/`db_url`.
 
-**Not yet wired** in this PR — staged for the Part 2 follow-up: the `createBackend` multi-tenant code path that **requires** a per-tenant `DB_URL`, **asserts** it lands on `rig_t_<id>_mem` at startup (`assertCurrentDatabase`), disables the SQLite fallback, and refuses to start on mismatch — and the cross-tenant DB-isolation integration test that proves it. Setting `TENANT_ID` has **no runtime effect** until Part 2 lands.
+**Adapter — now wired (Part 2):** when `TENANT_ID` is set, `createBackend`:
+
+- **requires** a per-tenant Postgres `DB_URL` (the SQLite fallback is **disabled** in multi-tenant mode);
+- **asserts** the connection lands on `rig_t_<id>_mem` (`assertCurrentDatabase`) **before** `initSchema`, so a wrong-DB DSN can't even create the schema in the wrong place;
+- is **fatal on any failure** (missing DSN, wrong DB, connect error) — it never silently degrades to a shared/SQLite store;
+- hard-rejects any tool call carrying a forbidden tenant/db argument (`findForbiddenTenantArg`).
+
+Legacy single-tenant mode (`TENANT_ID` unset) is unchanged. The cross-tenant DB-isolation suite in `test.js` (`runTenantIsolationTests`) proves the boundary with a strong negative oracle (tenant A's DB never returns tenant B's rows, and vice-versa) and is **load-bearing**: it hard-fails rather than silently skipping (the `ALLOW_SKIP_ISOLATION_TEST` opt-out only tolerates a missing-CREATEDB-privilege error, never an isolation regression).
 
 > **Conductor wiring (Part B of rc#1478)** — injecting the per-tenant `DB_URL`/secret-ref into the agent session via the P0 `ITenantResolver` / `Tenant` registry — lands when per-tenant agent pods exist (gated on the namespace-per-tenant item #1482).
 

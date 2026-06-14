@@ -50,7 +50,7 @@ rig-memory-mcp/
 | `REPO` | — | Default repo for writes |
 | `OPENAI_API_KEY` | — | Enables embedding generation |
 | `OPENAI_BASE_URL` | — | Override OpenAI base URL |
-| `TENANT_ID` | — | Reserved for **multi-tenant mode (rc#1478)**. The policy module that validates this var lives in `tenant.js`; the createBackend wiring + DB assertion that *enforce* it ship in the Part 2 follow-up — until then setting `TENANT_ID` has no runtime effect |
+| `TENANT_ID` | — | **Multi-tenant mode (rc#1478).** When set (server-trusted, never a tool arg), `createBackend` requires a per-tenant `DB_URL`, asserts the connection lands on `rig_t_<id>_mem` before `initSchema`, **disables the SQLite fallback**, and is fatal on mismatch. Unset ⟹ legacy single-tenant mode (unchanged). Validated/derived in `tenant.js` |
 
 ## Running tests
 

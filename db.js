@@ -103,6 +103,27 @@ export async function initSchema(pool) {
   }
 }
 
+/**
+ * Fail-closed assertion that `pool` is connected to `expectedDb` (rc#1478 Part 2). The per-tenant
+ * memory boundary IS the database (`rig_t_<id>_mem`), so this verifies
+ * `SELECT current_database()` === expectedDb BEFORE any schema or queries run — a misconfigured
+ * per-tenant DSN can then never land a tenant's reads/writes in the wrong (or shared) database.
+ * Throws on mismatch.
+ *
+ * @param {import('pg').Pool} pool
+ * @param {string} expectedDb the derived `rig_t_<id>_mem` name (from tenant.js `memoryDbName`)
+ */
+export async function assertCurrentDatabase(pool, expectedDb) {
+  const { rows } = await pool.query("SELECT current_database() AS db");
+  const actual = rows[0]?.db;
+  if (actual !== expectedDb) {
+    throw new Error(
+      `Tenant DB assertion failed: connected to '${actual}', expected '${expectedDb}'. ` +
+        "The per-tenant memory boundary is the database — refusing to operate on the wrong DB (fail closed)."
+    );
+  }
+}
+
 // ---------- Queries ----------
 
 /**
