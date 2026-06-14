@@ -1,6 +1,24 @@
 name: Publish
 
+# Trigger model:
+#   - `release: types: [published]`  — fired when release-please merges its
+#     release PR and creates a GitHub release. This is the ONLY event under
+#     which we attempt to publish the npm package, because GHCR/npm reject
+#     re-publishes of an existing version (409 Conflict). Gating on the
+#     release event guarantees the version in package.json is fresh.
+#   - `workflow_dispatch`            — manual recovery (e.g. a release event
+#     fired but npm publish hit a transient error). The job still guards
+#     itself with `npm view` so a re-dispatch on an already-published
+#     version succeeds idempotently instead of failing main.
+#   - `push: branches: [main]`       — fires the Docker job only. Docker
+#     image tags are content-addressed (`sha-<commit>` + `latest`) so
+#     re-pushing on every main commit is safe and desired.
+#
+# See docs/troubleshooting.md → "Publish npm package — Cannot publish over
+# existing version" for the failure mode this gating prevents.
 on:
+  release:
+    types: [published]
   workflow_dispatch:
   push:
     branches: [main]
@@ -12,6 +30,10 @@ permissions:
 jobs:
   publish-npm:
     name: Publish npm package
+    # Only attempt npm publish on a real release or a manual dispatch.
+    # Skipping on push-to-main avoids the 409-on-every-merge regression
+    # (see issue #31).
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,12 +45,33 @@ jobs:
 
       - run: npm ci
 
-      - run: npm publish
+      - name: Skip if version already published
+        id: check
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          echo "Checking $PKG_NAME@$PKG_VERSION on GitHub Packages…"
+          if npm view "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "Already published — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not yet published — will publish."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to GitHub Packages
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish
 
   publish-docker:
     name: Publish Docker image to GHCR
+    # Docker tags are content-addressed; safe to re-publish on every push.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
