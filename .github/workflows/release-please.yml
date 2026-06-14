@@ -12,11 +12,59 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      # Probe RELEASE_PAT before handing it to the action. The action treats
+      # any non-empty string as "the token to use" and fails the whole workflow
+      # with "Bad credentials" if it's set to an expired/invalid value — which
+      # in turn keeps main red until an operator rotates the secret.
+      # See docs/troubleshooting.md → "release-please".
+      - name: Probe RELEASE_PAT
+        id: pat
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          if [ -z "$RELEASE_PAT" ]; then
+            echo "RELEASE_PAT not set — will fall back to GITHUB_TOKEN."
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: token $RELEASE_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user)
+          if [ "$code" = "200" ]; then
+            echo "RELEASE_PAT valid."
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::RELEASE_PAT is set but invalid (HTTP $code). Falling back to GITHUB_TOKEN. See docs/troubleshooting.md → 'Bad credentials'."
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Path A — valid PAT. Run normally; any failure here is a real failure.
+      - name: release-please (with RELEASE_PAT)
+        if: steps.pat.outputs.valid == 'true'
+        uses: googleapis/release-please-action@v4
         with:
-          # Prefer a PAT (RELEASE_PAT) when set so release-please can create
-          # PRs even if the repo/org has "Allow GitHub Actions to create and
-          # approve pull requests" disabled. Fall back to github.token so the
-          # workflow doesn't hard-fail on unset/empty secret. See
-          # docs/troubleshooting.md for the failure modes this guards against.
-          token: ${{ secrets.RELEASE_PAT || github.token }}
+          token: ${{ secrets.RELEASE_PAT }}
+
+      # Path B — no valid PAT. Best-effort with GITHUB_TOKEN. If the org
+      # disables "Allow GitHub Actions to create and approve pull requests"
+      # the action will fail with "not permitted" — we degrade to a workflow
+      # warning instead of red-main, since the only fix is an operator action
+      # (rotate PAT or enable the repo setting). Main regressions in other
+      # workflows still fail as normal.
+      - name: release-please (best-effort with GITHUB_TOKEN)
+        if: steps.pat.outputs.valid != 'true'
+        id: release_be
+        continue-on-error: true
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Note best-effort outcome
+        if: steps.pat.outputs.valid != 'true'
+        run: |
+          if [ "${{ steps.release_be.outcome }}" = "success" ]; then
+            echo "release-please succeeded with GITHUB_TOKEN."
+          else
+            echo "::warning::release-please could not run without valid credentials. Set a valid RELEASE_PAT or enable Settings → Actions → 'Allow GitHub Actions to create and approve pull requests'. See docs/troubleshooting.md. Main stays green; the release PR will not be created until this is fixed."
+          fi
