@@ -1,0 +1,10 @@
+# Rig agent configuration — registers rig-memory-mcp with rig-conductor.
+# Node 22 ESM MCP memory server (Postgres+pgvector primary, SQLite fallback).
+# NOTE: the `node test.js` Postgres suite needs a pgvector/pgvector:pg16 service +
+# DB_URL/AGENT_ROLE (see .github/workflows/ci.yml); without DB_URL only the
+# SQLite/tenant unit suites run.
+stack: node
+tools: []
+testCommand: node test.js
+buildCommand: npm ci
+escalate: []
