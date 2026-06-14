@@ -8,6 +8,36 @@ updated: "2026-06-14"
 
 # Troubleshooting
 
+## Publish npm package
+
+### `npm publish` fails with `409 Conflict — Cannot publish over existing version`
+
+**Symptom:** Every push to `main` produces a `failure` run for the `Publish npm package` job in `.github/workflows/publish.yml`:
+
+```
+npm error code E409
+npm error 409 Conflict - PUT https://npm.pkg.github.com/@dashecorp%2frig-memory-mcp - Cannot publish over existing version
+```
+
+**Cause:** The historical trigger was `push: branches: [main]`, so every merge to `main` tried to re-publish the version currently in `package.json`. GitHub Packages (like npm) rejects re-publishing an existing immutable version, so the workflow went red on every merge that didn't happen to bump the version — i.e., almost every merge.
+
+**Fix (applied — see issue #31):** `publish-npm` is now gated to:
+
+| Trigger | Why |
+|---|---|
+| `release: types: [published]` | release-please creates a GitHub release when its release PR is merged. That is the moment a fresh version is canonical and ready to publish. |
+| `workflow_dispatch` | Manual recovery for transient publish failures. |
+
+`push: branches: [main]` no longer fires the npm job. A defensive `npm view` guard also makes a manual `workflow_dispatch` on an already-published version succeed (skip) instead of fail.
+
+`publish-docker` still runs on push because Docker tags (`sha-<commit>`, `latest`) are content-addressed — re-pushing is safe.
+
+**End-to-end happy path:** merge to `main` → release-please proposes/updates a release PR → operator (or the bot) merges the release PR → release-please creates a GitHub release → `Publish` workflow fires on `release: published` → npm package goes out.
+
+If release-please is degraded (no release PRs being created), npm publishes simply don't fire — main stays green. See the release-please section below for restoring it.
+
+---
+
 ## Release Please
 
 ### `release-please` fails with "Bad credentials" or "not permitted to create … pull requests"
