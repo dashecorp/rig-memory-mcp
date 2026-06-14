@@ -2,11 +2,8 @@
 title: rig-memory-mcp API Reference
 description: MCP tool API for the agent memory server — Postgres+pgvector primary, SQLite fallback
 type: reference
-queries:
-  - rig memory mcp tools
-  - write_memory read_memories list_recent mark_used compact_repo
-  - agent memory postgres pgvector sqlite fallback
-updated: 2026-04-19
+audience: both
+updated: 2026-06-14
 ---
 
 # rig-memory-mcp API Reference
