@@ -3,39 +3,48 @@ title: "Troubleshooting"
 description: "Common CI/release failures in rig-memory-mcp and how to fix them"
 type: runbook
 audience: both
-updated: "2026-06-12"
+updated: "2026-06-14"
 ---
 
 # Troubleshooting
 
 ## Release Please
 
-### `release-please` fails with "GitHub Actions is not permitted to create or approve pull requests"
+### `release-please` fails with "Bad credentials" or "not permitted to create … pull requests"
 
-**Symptom:** Every push to `main` produces a `failure` run for `.github/workflows/release-please.yml`. The `googleapis/release-please-action@v4` step ends with:
+**Symptom:** Every push to `main` produces a `failure` run for `.github/workflows/release-please.yml`. The `googleapis/release-please-action@v4` step ends with one of:
 
 ```
+##[error]release-please failed: Bad credentials — https://docs.github.com/rest
 ##[error]release-please failed: GitHub Actions is not permitted to create or approve pull requests.
 ```
 
-The release PR is never created and main goes red.
+The release PR is never created.
 
-**Cause:** The default `GITHUB_TOKEN` cannot create pull requests when the repo (or org) has **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"** disabled. This is the hardened default for `dashecorp` repos.
+**Cause:** Two distinct credential failure modes:
 
-**Fix (workflow side — already applied):** The workflow now reads a PAT first and falls back to `github.token`:
+| Error | Cause |
+|---|---|
+| `Bad credentials` | `RELEASE_PAT` is set but expired/invalid. The previous workflow expression `secrets.RELEASE_PAT \|\| github.token` picks any non-empty PAT — even an invalid one — over `github.token`. |
+| `not permitted to create or approve pull requests` | `GITHUB_TOKEN` is being used but **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"** is disabled (the hardened default for `dashecorp` repos). |
 
-```yaml
-token: ${{ secrets.RELEASE_PAT || github.token }}
-```
+**Workflow-side fix (applied #28):** The workflow now **probes `RELEASE_PAT` validity** before handing it to the action, and degrades gracefully so a credential outage doesn't turn main red:
 
-**Operator action — one of the following is required for the workflow to actually succeed:**
+| Probe outcome | Behavior |
+|---|---|
+| `RELEASE_PAT` set and valid (HTTP 200 on `/user`) | Run release-please with the PAT. Failures here are real failures. |
+| `RELEASE_PAT` unset, or set but invalid | Emit a workflow warning. Run release-please best-effort with `GITHUB_TOKEN` under `continue-on-error: true`. If that also fails (repo setting disabled), the step ends with a workflow warning; main stays green. |
+
+This means: as long as a regression isn't in release-please itself, main will not go red over a missing/expired PAT. The release PR simply won't get created until an operator fixes credentials.
+
+**Operator action — one of the following is required for the release PR to actually get created:**
 
 | Option | What to do | Notes |
 |---|---|---|
-| A. Set a PAT | Settings → Secrets and variables → Actions → New repository secret `RELEASE_PAT`. The PAT needs `repo` + `workflow` scope (classic) or `contents:write` + `pull-requests:write` (fine-grained). | Preferred — PAT-created PRs also trigger downstream workflow runs. |
+| A. Set a valid PAT | Settings → Secrets and variables → Actions → repository secret `RELEASE_PAT`. The PAT needs `repo` + `workflow` scope (classic) or `contents:write` + `pull-requests:write` (fine-grained). | Preferred — PAT-created PRs also trigger downstream workflow runs. |
 | B. Enable the repo setting | Settings → Actions → General → Workflow permissions → check "Allow GitHub Actions to create and approve pull requests". | Simpler but the release PR's own CI will not auto-trigger (GITHUB_TOKEN limitation). |
 
-If `RELEASE_PAT` is set but **expired/invalid**, the action will fail with `Bad credentials` instead. Rotate the PAT or delete the secret to fall back to `github.token`.
+If you set a PAT then later rotate/revoke it, the workflow will detect the bad credential on the next push and degrade automatically — no rush to update the workflow.
 
 ---
 
