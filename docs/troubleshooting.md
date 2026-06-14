@@ -3,10 +3,53 @@ title: "Troubleshooting"
 description: "Common CI/release failures in rig-memory-mcp and how to fix them"
 type: runbook
 audience: both
-updated: "2026-06-12"
+updated: "2026-06-14"
 ---
 
 # Troubleshooting
+
+## Publish
+
+### `npm publish` fails with `E409 Cannot publish over existing version`
+
+**Symptom:** The `Publish` workflow fails on push to `main`:
+
+```
+npm error code E409
+npm error 409 Conflict - PUT https://npm.pkg.github.com/@dashecorp%2frig-memory-mcp - Cannot publish over existing version
+```
+
+Main goes red even though no real regression happened.
+
+**Cause:** `publish.yml` runs on **every** push to `main`, but `package.json#version` only bumps when a release-please PR merges. Between release PRs, the version in the repo equals the version already on the registry, so `npm publish` 409s. This is purely a workflow-shape problem — the package is fine.
+
+**Fix (workflow side — applied):** The publish step now treats a 409 as a no-op and emits a workflow notice instead of failing:
+
+```yaml
+- name: Publish to GitHub Packages (idempotent)
+  env:
+    NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    set +e
+    OUTPUT=$(npm publish 2>&1)
+    CODE=$?
+    echo "$OUTPUT"
+    if [ $CODE -eq 0 ]; then exit 0; fi
+    if echo "$OUTPUT" | grep -qE 'E409|Cannot publish over existing version'; then
+      echo "::notice::Version already published — skipping (waiting for release-please bump)."
+      exit 0
+    fi
+    exit $CODE
+```
+
+Real publish failures (auth, network, malformed package) still fail the job. Only the "already published" case is swallowed.
+
+**Operator notes:**
+
+- The actual release lifecycle is: commits land on `main` → release-please opens/updates a release PR → operator merges the release PR → `package.json` and `.release-please-manifest.json` bump → next push triggers a real publish.
+- If you want stricter publish-on-tag semantics later, change the workflow trigger to `on: release: types: [published]` or `on: push: tags: ['v*']`. The current shape is fine as long as the 409 guard is in place.
+
+---
 
 ## Release Please
 

@@ -23,9 +23,28 @@ jobs:
 
       - run: npm ci
 
-      - run: npm publish
+      # Idempotent publish: this workflow runs on every push to main, but the
+      # version in package.json only bumps when a release-please PR merges.
+      # Without this guard, every non-release push fails with
+      # `E409 Cannot publish over existing version` and reddens main.
+      # See docs/troubleshooting.md → "npm publish fails with E409".
+      - name: Publish to GitHub Packages (idempotent)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          OUTPUT=$(npm publish 2>&1)
+          CODE=$?
+          echo "$OUTPUT"
+          if [ $CODE -eq 0 ]; then
+            exit 0
+          fi
+          if echo "$OUTPUT" | grep -qE 'E409|Cannot publish over existing version'; then
+            VERSION=$(node -p "require('./package.json').version")
+            echo "::notice::Version $VERSION already published — treating as no-op (waiting for release-please to bump)."
+            exit 0
+          fi
+          exit $CODE
 
   publish-docker:
     name: Publish Docker image to GHCR
